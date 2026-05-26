@@ -1,0 +1,17 @@
+.DS_Store
+node_modules/
+dist/
+build/
+.env
+.venv/
+__pycache__/
+*.pyc
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/materials/*
+data/exports/*
+data/tmp/*
+!data/materials/.gitkeep
+!data/exports/.gitkeep
+!data/tmp/.gitkeep

@@ -1,0 +1,7 @@
+fastapi==0.125.0
+uvicorn==0.38.0
+pydantic-settings==2.12.0
+httpx==0.28.1
+python-dotenv==1.2.1
+python-multipart==0.0.21
+alibaba-nls-python-sdk==1.0.2
