@@ -367,6 +367,125 @@ def export_segments(segments: list[dict[str, object]], output_dir: Path | None =
     return export_path
 
 
+def export_timeline(timeline: dict[str, object], output_dir: Path | None = None) -> Path:
+    ensure_data_dirs()
+    clips = list(timeline.get("clips", []))
+    if not clips:
+        raise VideoProcessingError("时间线里还没有片段。")
+
+    export_id = uuid.uuid4().hex
+    normalized_dir = TMP_DIR / f"timeline_export_{export_id}"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    concat_list_path = normalized_dir / "concat.txt"
+    normalized_paths: list[Path] = []
+
+    for index, clip in enumerate(clips):
+        source_path = Path(str(clip["source_path"]))
+        if not source_path.exists():
+            raise VideoProcessingError(f"源视频文件不存在：{source_path}")
+        source_in = float(clip["source_in"])
+        source_out = float(clip["source_out"])
+        if source_out <= source_in:
+            raise VideoProcessingError("时间线片段时间无效。")
+        normalized_path = normalized_dir / f"clip_{index:03d}.mp4"
+        _encode_precise_clip(
+            source_path,
+            normalized_path,
+            start_seconds=source_in,
+            video_end_seconds=source_out,
+            audio_end_seconds=source_out,
+            preset="veryfast",
+            crf="23",
+            faststart=False,
+        )
+        normalized_paths.append(normalized_path)
+
+    concat_list_path.write_text(
+        "".join(f"file '{path.as_posix()}'\n" for path in normalized_paths),
+        encoding="utf-8",
+    )
+    target_dir = output_dir or EXPORTS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    timeline_id = timeline.get("id") or timeline.get("timeline_id") or "timeline"
+    export_path = target_dir / f"material_mix_{timeline_id}_{export_id}.mp4"
+    _run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list_path),
+            "-c",
+            "copy",
+            str(export_path),
+        ]
+    )
+    return export_path
+
+
+def create_timeline_preview(timeline: dict[str, object]) -> Path:
+    clips = list(timeline.get("clips", []))
+    if not clips:
+        raise VideoProcessingError("时间线里还没有片段。")
+    timeline_id = timeline.get("id") or timeline.get("timeline_id") or "timeline"
+    signature = hashlib.sha256(
+        ("timeline_v1|" + "|".join(
+            (
+                f"{clip.get('clip_id')}:{clip.get('segment_id')}:{clip.get('position')}:"
+                f"{float(clip['source_in']):.3f}:{float(clip['source_out']):.3f}"
+            )
+            for clip in clips
+        )).encode("utf-8")
+    ).hexdigest()[:16]
+    preview_dir = TMP_DIR / "material_mix_previews" / str(timeline_id)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    target_path = preview_dir / f"preview_{signature}.mp4"
+    if target_path.exists():
+        return target_path
+    for old_path in preview_dir.glob("preview_*.mp4"):
+        old_path.unlink(missing_ok=True)
+    generated_path = export_timeline(timeline, output_dir=preview_dir)
+    generated_path.rename(target_path)
+    return target_path
+
+
+def create_timeline_clip_preview(clip: dict[str, object]) -> Path:
+    source_path = Path(str(clip["source_path"]))
+    if not source_path.exists():
+        raise VideoProcessingError(f"源视频文件不存在：{source_path}")
+    source_in = float(clip["source_in"])
+    source_out = float(clip["source_out"])
+    if source_out - source_in < 0.3:
+        raise VideoProcessingError("时间线片段至少保留 0.3 秒。")
+    signature = hashlib.sha256(
+        (
+            f"timeline_clip_v1|{clip.get('clip_id')}:{clip.get('segment_id')}:"
+            f"{source_in:.3f}:{source_out:.3f}:{source_path}"
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    preview_dir = TMP_DIR / "material_mix_clip_previews" / str(clip.get("timeline_id") or "timeline")
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    target_path = preview_dir / f"clip_{clip.get('clip_id')}_{signature}.mp4"
+    if target_path.exists():
+        return target_path
+    for old_path in preview_dir.glob(f"clip_{clip.get('clip_id')}_*.mp4"):
+        old_path.unlink(missing_ok=True)
+    _encode_precise_clip(
+        source_path,
+        target_path,
+        start_seconds=source_in,
+        video_end_seconds=source_out,
+        audio_end_seconds=source_out,
+        preset="ultrafast",
+        crf="28",
+        faststart=True,
+    )
+    return target_path
+
+
 def _encode_precise_clip(
     source_path: Path,
     target_path: Path,

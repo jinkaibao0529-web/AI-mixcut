@@ -1404,6 +1404,253 @@ input[type="number"] {
   gap: 12px;
 }
 
+.material-mix-page {
+  display: grid;
+  gap: 16px;
+}
+
+.material-mix-head {
+  gap: 12px;
+}
+
+.timeline-total {
+  background: #e3f8f0;
+  border: 1px solid #8eedc7;
+  border-radius: 8px;
+  display: grid;
+  gap: 3px;
+  min-width: 112px;
+  padding: 10px 12px;
+  text-align: right;
+}
+
+.timeline-total span {
+  color: #12715b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.timeline-total strong {
+  color: #014d40;
+  font-size: 20px;
+}
+
+.material-mix-controls {
+  align-items: end;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(180px, 1fr) auto minmax(220px, 1.2fr) auto auto;
+}
+
+.material-output-dir {
+  color: #627d98;
+  font-size: 13px;
+  margin: -2px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.material-mix-layout {
+  align-items: start;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(420px, 0.9fr) minmax(520px, 1.1fr);
+}
+
+.compact-title {
+  margin-bottom: 12px;
+}
+
+.compact-title p {
+  color: #829ab1;
+  font-size: 13px;
+  margin: 4px 0 0;
+}
+
+.material-segment-picker,
+.material-timeline-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.material-preview-box {
+  background: #0f172a;
+  border-radius: 8px;
+  display: grid;
+  min-height: 280px;
+  overflow: hidden;
+  place-items: center;
+}
+
+.material-preview-box video {
+  aspect-ratio: 9 / 16;
+  background: #0f172a;
+  max-height: 52vh;
+  object-fit: contain;
+  width: min(100%, 360px);
+}
+
+.material-preview-empty {
+  color: #d9e2ec;
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+  padding: 34px;
+  text-align: center;
+}
+
+.material-preview-empty strong {
+  font-size: 18px;
+}
+
+.material-preview-empty span {
+  color: #9fb3c8;
+  font-size: 13px;
+}
+
+.material-segment-list,
+.timeline-clip-list {
+  display: grid;
+  gap: 10px;
+  max-height: calc(100vh - 360px);
+  min-height: 280px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.material-empty-note {
+  border: 1px dashed #bcccdc;
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+}
+
+.material-segment-row {
+  align-items: start;
+  border: 1px solid #edf2f7;
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 76px minmax(0, 1fr) auto;
+  padding: 10px;
+}
+
+.material-segment-row img {
+  aspect-ratio: 9 / 16;
+  background: #111827;
+  border-radius: 6px;
+  object-fit: cover;
+  width: 100%;
+}
+
+.material-segment-row strong,
+.timeline-clip-meta strong {
+  color: #334e68;
+  font-size: 13px;
+}
+
+.material-segment-row p,
+.timeline-clip-card p {
+  color: #243b53;
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 5px 0;
+}
+
+.material-segment-row small,
+.timeline-clip-card small {
+  color: #829ab1;
+  font-size: 12px;
+}
+
+.timeline-clip-card {
+  align-items: start;
+  background: #fff;
+  border: 1px solid #edf2f7;
+  border-radius: 8px;
+  cursor: pointer;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  padding: 12px;
+}
+
+.timeline-clip-card.active {
+  border-color: #2f80ed;
+  box-shadow: 0 10px 24px rgba(16, 42, 67, 0.08);
+}
+
+.timeline-position {
+  align-items: center;
+  background: #eef2f7;
+  border-radius: 999px;
+  color: #334e68;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 900;
+  height: 34px;
+  justify-content: center;
+  width: 34px;
+}
+
+.timeline-clip-meta {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.timeline-clip-meta span {
+  color: #627d98;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.timeline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.timeline-empty {
+  border: 1px dashed #bcccdc;
+  border-radius: 8px;
+  padding: 28px;
+  text-align: center;
+}
+
+.clip-trim-panel {
+  border-top: 1px solid #edf2f7;
+  display: grid;
+  gap: 12px;
+  padding-top: 14px;
+}
+
+.material-clip-preview {
+  background: #0f172a;
+  border-radius: 8px;
+  display: grid;
+  min-height: 220px;
+  overflow: hidden;
+  place-items: center;
+}
+
+.material-clip-preview video {
+  aspect-ratio: 9 / 16;
+  background: #0f172a;
+  max-height: 38vh;
+  object-fit: contain;
+  width: min(100%, 280px);
+}
+
+.clip-trim-caption {
+  color: #627d98;
+  font-size: 13px;
+  margin: 0;
+}
+
 .scheme-detail {
   position: sticky;
   top: 18px;
@@ -1880,6 +2127,7 @@ input[type="number"] {
 @media (max-width: 1100px) {
   .studio-shell,
   .scheme-layout,
+  .material-mix-layout,
   .settings-grid,
   .overview-grid {
     grid-template-columns: 1fr;

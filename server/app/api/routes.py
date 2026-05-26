@@ -28,16 +28,22 @@ from app.services.workspace_store import (
     get_project,
     get_scheme,
     get_segment,
+    get_material_mix_timeline,
     get_segments_by_ids,
     get_settings,
     get_video,
     init_workspace_db,
+    add_material_mix_clip,
+    create_material_mix_timeline,
+    delete_material_mix_clip,
     list_projects,
+    list_material_mix_timelines,
     list_schemes,
     list_segments,
     list_videos,
     move_scheme_segment,
     split_segment,
+    update_material_mix_clip,
     update_project,
     update_segment,
     update_scheme_segment,
@@ -60,9 +66,12 @@ from app.services.video_processor import (
     create_segment_range_preview,
     create_segment_preview,
     create_scheme_preview,
+    create_timeline_clip_preview,
+    create_timeline_preview,
     create_thumbnail,
     export_segment_files,
     export_segments,
+    export_timeline,
     file_sha256,
     probe_video,
     export_materials,
@@ -247,6 +256,25 @@ class SchemeExportRequest(BaseModel):
 
 class SegmentDedupeRequest(BaseModel):
     dry_run: bool = False
+
+
+class MaterialMixTimelineCreateRequest(BaseModel):
+    project_id: int
+    name: str = Field(default="素材混剪方案 01", min_length=1, max_length=80)
+
+
+class MaterialMixClipCreateRequest(BaseModel):
+    segment_id: int
+
+
+class MaterialMixClipPatchRequest(BaseModel):
+    source_in: float | None = Field(default=None, ge=0)
+    source_out: float | None = Field(default=None, gt=0)
+    action: str | None = Field(default=None, pattern="^(move_up|move_down)$")
+
+
+class MaterialMixExportRequest(BaseModel):
+    output_dir: str | None = None
 
 
 @router.get("/health")
@@ -720,6 +748,116 @@ def video_preview(video_id: int) -> FileResponse:
         raise HTTPException(status_code=404, detail="Video file not found.")
     media_type = mimetypes.guess_type(video_path.name)[0] or "video/mp4"
     return FileResponse(video_path, media_type=media_type, filename=video_path.name)
+
+
+@router.post("/material-mix/timelines")
+def create_material_mix(payload: MaterialMixTimelineCreateRequest) -> dict[str, object]:
+    timeline = create_material_mix_timeline(payload.project_id, payload.name)
+    if not timeline:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return timeline
+
+
+@router.get("/material-mix/timelines")
+def read_material_mix_timelines(project_id: int | None = None) -> list[dict[str, object]]:
+    return list_material_mix_timelines(project_id)
+
+
+@router.get("/material-mix/timelines/{timeline_id}")
+def read_material_mix_timeline(timeline_id: int) -> dict[str, object]:
+    timeline = get_material_mix_timeline(timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found.")
+    return timeline
+
+
+@router.post("/material-mix/timelines/{timeline_id}/clips")
+def add_material_mix_timeline_clip(timeline_id: int, payload: MaterialMixClipCreateRequest) -> dict[str, object]:
+    if get_segment(payload.segment_id) is None:
+        raise HTTPException(status_code=404, detail="Segment not found.")
+    timeline = add_material_mix_clip(timeline_id, payload.segment_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found or segment is outside this project.")
+    return timeline
+
+
+@router.patch("/material-mix/timelines/{timeline_id}/clips/{clip_id}")
+def patch_material_mix_timeline_clip(timeline_id: int, clip_id: int, payload: MaterialMixClipPatchRequest) -> dict[str, object]:
+    if payload.source_in is not None or payload.source_out is not None:
+        timeline = get_material_mix_timeline(timeline_id)
+        if timeline is None:
+            raise HTTPException(status_code=404, detail="Timeline not found.")
+        current_clip = next((item for item in timeline["clips"] if int(item["clip_id"]) == clip_id), None)
+        if current_clip is None:
+            raise HTTPException(status_code=404, detail="Timeline clip not found.")
+        next_in = float(payload.source_in if payload.source_in is not None else current_clip["source_in"])
+        next_out = float(payload.source_out if payload.source_out is not None else current_clip["source_out"])
+        if next_out <= next_in:
+            raise HTTPException(status_code=400, detail="片段结束时间必须大于开始时间。")
+        if next_out - next_in < 0.3:
+            raise HTTPException(status_code=400, detail="时间线片段至少保留 0.3 秒。")
+    timeline = update_material_mix_clip(
+        timeline_id,
+        clip_id,
+        source_in=payload.source_in,
+        source_out=payload.source_out,
+        action=payload.action,
+    )
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline clip not found or invalid timing.")
+    return timeline
+
+
+@router.delete("/material-mix/timelines/{timeline_id}/clips/{clip_id}")
+def remove_material_mix_timeline_clip(timeline_id: int, clip_id: int) -> dict[str, object]:
+    timeline = delete_material_mix_clip(timeline_id, clip_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline clip not found.")
+    return timeline
+
+
+@router.get("/material-mix/timelines/{timeline_id}/clips/{clip_id}/preview")
+def preview_material_mix_timeline_clip(timeline_id: int, clip_id: int) -> FileResponse:
+    timeline = get_material_mix_timeline(timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found.")
+    clip = next((item for item in timeline["clips"] if int(item["clip_id"]) == clip_id), None)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="Timeline clip not found.")
+    try:
+        preview_path = create_timeline_clip_preview(clip)
+    except VideoProcessingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(preview_path, media_type="video/mp4", filename=preview_path.name)
+
+
+@router.get("/material-mix/timelines/{timeline_id}/preview")
+def preview_material_mix_timeline(timeline_id: int) -> FileResponse:
+    timeline = get_material_mix_timeline(timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found.")
+    try:
+        preview_path = create_timeline_preview(timeline)
+    except VideoProcessingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(preview_path, media_type="video/mp4", filename=preview_path.name)
+
+
+@router.post("/material-mix/timelines/{timeline_id}/export")
+def export_material_mix_timeline(timeline_id: int, payload: MaterialMixExportRequest | None = None) -> dict[str, object]:
+    timeline = get_material_mix_timeline(timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found.")
+    try:
+        output_dir = Path(payload.output_dir).expanduser() if payload and payload.output_dir else None
+        export_path = export_timeline(timeline, output_dir=output_dir)
+    except VideoProcessingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "export_path": str(export_path),
+        "timeline_id": timeline_id,
+        "clip_ids": [int(item["clip_id"]) for item in timeline["clips"]],
+    }
 
 
 @router.get("/projects/{project_id}/schemes/recommendation")

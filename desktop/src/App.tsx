@@ -9,7 +9,7 @@ const SIDEBAR_CATEGORY_LIMIT = 4;
 const SCHEME_PREVIEW_START_GUARD_SECONDS = 0.06;
 const SCHEME_PREVIEW_END_GUARD_SECONDS = 0.02;
 
-type WorkspaceView = "workspace" | "overview" | "import" | "segments" | "schemes" | "settings";
+type WorkspaceView = "workspace" | "overview" | "import" | "segments" | "materialMix" | "schemes" | "settings";
 
 type Project = {
   id: number;
@@ -81,6 +81,33 @@ type SchemeSegment = Segment & {
   position: number;
   reasoning: string;
   position_reasoning: string;
+};
+
+type MaterialMixClip = {
+  clip_id: number;
+  timeline_id: number;
+  segment_id: number;
+  source_path: string;
+  source_in: number;
+  source_out: number;
+  timeline_in: number;
+  timeline_out: number;
+  track_type: "video";
+  position: number;
+  text: string;
+  semantic_type: string;
+  position_type: string;
+  video_name: string;
+};
+
+type MaterialMixTimeline = {
+  id: number;
+  timeline_id: number;
+  project_id: number;
+  name: string;
+  duration_seconds: number;
+  clip_count: number;
+  clips?: MaterialMixClip[];
 };
 
 type Settings = Record<string, string>;
@@ -383,6 +410,14 @@ function App() {
               />
             )}
             {view === "segments" && <SegmentLibrary segments={segments} videos={videos} onRefresh={() => loadProjectData(activeProject.id)} setError={setError} setMessage={setMessage} />}
+            {view === "materialMix" && (
+              <MaterialMixWorkspace
+                project={activeProject}
+                segments={segments}
+                setMessage={setMessage}
+                setError={setError}
+              />
+            )}
             {view === "schemes" && (
               <SchemeWorkspace
                 project={activeProject}
@@ -551,6 +586,7 @@ function ProjectHeader(props: { project: Project; view: WorkspaceView; setView: 
     ["overview", "概览"],
     ["import", "导入分析"],
     ["segments", "片段库"],
+    ["materialMix", "素材混剪"],
     ["schemes", "混剪方案"],
   ];
   return (
@@ -904,6 +940,450 @@ function parseTranscriptSegments(value: string | undefined): TranscriptSegment[]
   } catch {
     return [];
   }
+}
+
+function MaterialMixWorkspace(props: {
+  project: Project;
+  segments: Segment[];
+  setMessage: (value: string) => void;
+  setError: (value: string) => void;
+}) {
+  const [timelines, setTimelines] = useState<MaterialMixTimeline[]>([]);
+  const [selectedTimelineId, setSelectedTimelineId] = useState<number | null>(null);
+  const [selectedTimeline, setSelectedTimeline] = useState<MaterialMixTimeline | null>(null);
+  const [newTimelineName, setNewTimelineName] = useState("素材混剪方案 01");
+  const [query, setQuery] = useState("");
+  const [outputDir, setOutputDir] = useState("");
+  const [previewVersion, setPreviewVersion] = useState(0);
+  const [clipPreviewVersion, setClipPreviewVersion] = useState(0);
+  const [selectedClipId, setSelectedClipId] = useState<number | null>(null);
+  const [clipDraft, setClipDraft] = useState<Partial<MaterialMixClip>>({});
+  const [clipPreviewMode, setClipPreviewMode] = useState<"start" | "end" | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const timelinePreviewRef = useRef<HTMLVideoElement | null>(null);
+  const clipPreviewRef = useRef<HTMLVideoElement | null>(null);
+
+  const filteredSegments = props.segments.filter((segment) => (
+    !query.trim()
+    || `${segment.text} ${segment.video_name} ${segment.semantic_type} ${segment.position_type}`.toLowerCase().includes(query.trim().toLowerCase())
+  ));
+  const clips = selectedTimeline?.clips ?? [];
+  const selectedClip = clips.find((clip) => clip.clip_id === selectedClipId) ?? null;
+  const previewSource = selectedTimelineId && clips.length > 0
+    ? `${API_BASE_URL}/material-mix/timelines/${selectedTimelineId}/preview?v=${previewVersion}`
+    : "";
+  const clipPreviewSource = selectedTimelineId && selectedClip
+    ? `${API_BASE_URL}/material-mix/timelines/${selectedTimelineId}/clips/${selectedClip.clip_id}/preview?v=${clipPreviewVersion}`
+    : "";
+
+  useEffect(() => {
+    void loadTimelines();
+  }, [props.project.id]);
+
+  useEffect(() => {
+    if (!selectedTimelineId) {
+      setSelectedTimeline(null);
+      setSelectedClipId(null);
+      return;
+    }
+    void loadTimeline(selectedTimelineId);
+  }, [selectedTimelineId]);
+
+  useEffect(() => {
+    if (!selectedClip) {
+      setClipDraft({});
+      return;
+    }
+    setClipDraft(selectedClip);
+    const video = timelinePreviewRef.current;
+    if (video && previewSource) {
+      video.pause();
+      video.currentTime = Math.max(0, selectedClip.timeline_in);
+    }
+  }, [selectedClip?.clip_id, selectedClip?.timeline_in]);
+
+  useEffect(() => {
+    const video = clipPreviewRef.current;
+    if (!video || !selectedClip) return;
+    video.pause();
+    video.currentTime = 0;
+    setClipPreviewMode(null);
+  }, [selectedClip?.clip_id, clipPreviewSource]);
+
+  async function loadTimelines(nextSelectedId?: number) {
+    try {
+      const data = await api<MaterialMixTimeline[]>(`/material-mix/timelines?project_id=${props.project.id}`);
+      setTimelines(data);
+      const selectedId = nextSelectedId ?? selectedTimelineId ?? data[0]?.id ?? null;
+      setSelectedTimelineId(selectedId);
+      if (selectedId) {
+        await loadTimeline(selectedId);
+      } else {
+        setSelectedTimeline(null);
+      }
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "素材混剪列表加载失败");
+    }
+  }
+
+  async function loadTimeline(timelineId: number) {
+    try {
+      setSelectedTimeline(await api<MaterialMixTimeline>(`/material-mix/timelines/${timelineId}`));
+      setPreviewVersion((current) => current + 1);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "素材混剪详情加载失败");
+    }
+  }
+
+  async function createTimeline() {
+    try {
+      const timeline = await api<MaterialMixTimeline>("/material-mix/timelines", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: props.project.id, name: newTimelineName.trim() || "素材混剪方案" }),
+      });
+      props.setMessage("已创建素材混剪时间线。");
+      await loadTimelines(timeline.id);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "创建素材混剪失败");
+    }
+  }
+
+  async function addClip(segmentId: number) {
+    if (!selectedTimelineId) {
+      props.setError("请先创建或选择一条素材混剪时间线。");
+      return;
+    }
+    try {
+      const timeline = await api<MaterialMixTimeline>(`/material-mix/timelines/${selectedTimelineId}/clips`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ segment_id: segmentId }),
+      });
+      setSelectedTimeline(timeline);
+      setSelectedClipId(timeline.clips?.at(-1)?.clip_id ?? null);
+      setPreviewVersion((current) => current + 1);
+      setClipPreviewVersion((current) => current + 1);
+      await loadTimelines(timeline.id);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "添加片段失败");
+    }
+  }
+
+  async function patchClip(clipId: number, action: "move_up" | "move_down") {
+    if (!selectedTimelineId) return;
+    try {
+      const timeline = await api<MaterialMixTimeline>(`/material-mix/timelines/${selectedTimelineId}/clips/${clipId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      setSelectedTimeline(timeline);
+      if (selectedClipId && !timeline.clips?.some((clip) => clip.clip_id === selectedClipId)) {
+        setSelectedClipId(timeline.clips?.[0]?.clip_id ?? null);
+      }
+      setPreviewVersion((current) => current + 1);
+      setClipPreviewVersion((current) => current + 1);
+      await loadTimelines(timeline.id);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "调整片段顺序失败");
+    }
+  }
+
+  async function deleteClip(clipId: number) {
+    if (!selectedTimelineId) return;
+    try {
+      const timeline = await api<MaterialMixTimeline>(`/material-mix/timelines/${selectedTimelineId}/clips/${clipId}`, { method: "DELETE" });
+      setSelectedTimeline(timeline);
+      if (selectedClipId === clipId) {
+        setSelectedClipId(timeline.clips?.[0]?.clip_id ?? null);
+      }
+      setPreviewVersion((current) => current + 1);
+      setClipPreviewVersion((current) => current + 1);
+      await loadTimelines(timeline.id);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "删除时间线片段失败");
+    }
+  }
+
+  async function exportTimeline() {
+    if (!selectedTimelineId) {
+      props.setError("请先选择一条时间线。");
+      return;
+    }
+    setExporting(true);
+    try {
+      const result = await api<{ export_path: string }>(`/material-mix/timelines/${selectedTimelineId}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ output_dir: outputDir || undefined }),
+      });
+      props.setMessage(`素材混剪已导出：${result.export_path}`);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "素材混剪导出失败");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function chooseOutputDir() {
+    if (!window.electronAPI?.selectExportDirectory) {
+      props.setError("当前窗口没有连接到系统文件夹选择器，请重启软件后再试。");
+      return;
+    }
+    try {
+      const selectedPath = await window.electronAPI.selectExportDirectory();
+      if (selectedPath) {
+        setOutputDir(selectedPath);
+      }
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "选择保存路径失败");
+    }
+  }
+
+  async function updateClipTiming(values: Partial<Pick<MaterialMixClip, "source_in" | "source_out">>, mode: "start" | "end" | null = null) {
+    if (!selectedTimelineId || !selectedClip) return;
+    const nextIn = Number(values.source_in ?? selectedClip.source_in);
+    const nextOut = Number(values.source_out ?? selectedClip.source_out);
+    if (nextOut <= nextIn) {
+      props.setError("片段结束时间必须大于开始时间。");
+      return;
+    }
+    if (nextOut - nextIn < 0.3) {
+      props.setError("时间线片段至少保留 0.3 秒。");
+      return;
+    }
+    try {
+      const timeline = await api<MaterialMixTimeline>(`/material-mix/timelines/${selectedTimelineId}/clips/${selectedClip.clip_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(values),
+      });
+      setSelectedTimeline(timeline);
+      setSelectedClipId(selectedClip.clip_id);
+      setClipPreviewMode(mode);
+      setPreviewVersion((current) => current + 1);
+      setClipPreviewVersion((current) => current + 1);
+      await loadTimelines(timeline.id);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "片段出入点保存失败");
+    }
+  }
+
+  function nudgeClip(boundary: "start" | "end", delta: number) {
+    if (!selectedClip) return;
+    const value = boundary === "start"
+      ? Math.max(0, Number((selectedClip.source_in + delta).toFixed(1)))
+      : Math.max(0, Number((selectedClip.source_out + delta).toFixed(1)));
+    void updateClipTiming(boundary === "start" ? { source_in: value } : { source_out: value }, boundary);
+  }
+
+  function saveClipDraft() {
+    if (!selectedClip) return;
+    void updateClipTiming({
+      source_in: Number(clipDraft.source_in ?? selectedClip.source_in),
+      source_out: Number(clipDraft.source_out ?? selectedClip.source_out),
+    });
+  }
+
+  function handleClipPreviewLoaded() {
+    const video = clipPreviewRef.current;
+    if (!video) return;
+    if (clipPreviewMode === "end") {
+      video.currentTime = Math.max(0, video.duration - 0.8);
+      void video.play().catch(() => undefined);
+      return;
+    }
+    if (clipPreviewMode === "start") {
+      video.currentTime = 0;
+      void video.play().catch(() => undefined);
+      return;
+    }
+    video.currentTime = 0;
+    video.pause();
+  }
+
+  function handleClipPreviewTimeUpdate() {
+    const video = clipPreviewRef.current;
+    if (!video || !clipPreviewMode) return;
+    const stopAt = clipPreviewMode === "end" ? Math.max(0, video.duration - 0.05) : Math.min(video.duration, 0.8);
+    if (video.currentTime >= stopAt) {
+      video.pause();
+      video.currentTime = stopAt;
+      setClipPreviewMode(null);
+    }
+  }
+
+  function selectTimelineClip(clip: MaterialMixClip) {
+    setSelectedClipId(clip.clip_id);
+    const video = timelinePreviewRef.current;
+    if (video) {
+      video.pause();
+      video.currentTime = Math.max(0, clip.timeline_in);
+    }
+  }
+
+  return (
+    <section className="material-mix-page">
+      <div className="view-sticky-head material-mix-head">
+        <div className="section-title">
+          <div>
+            <h2>素材混剪</h2>
+            <p>从现有语义片段组装单视频轨时间线，确认顺序后导出成片。</p>
+          </div>
+          <div className="timeline-total">
+            <span>总时长</span>
+            <strong>{(selectedTimeline?.duration_seconds ?? 0).toFixed(1)}s</strong>
+          </div>
+        </div>
+        <div className="material-mix-controls">
+          <label>新时间线
+            <input value={newTimelineName} onChange={(event) => setNewTimelineName(event.target.value)} />
+          </label>
+          <button className="primary-action" onClick={createTimeline}>创建时间线</button>
+          <label>当前时间线
+            <select value={selectedTimelineId ?? ""} onChange={(event) => setSelectedTimelineId(Number(event.target.value) || null)}>
+              <option value="">未选择</option>
+              {timelines.map((timeline) => (
+                <option key={timeline.id} value={timeline.id}>
+                  {timeline.name} · {(timeline.duration_seconds ?? 0).toFixed(1)}s · {timeline.clip_count ?? 0}段
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="secondary" onClick={chooseOutputDir}>选择保存路径</button>
+          <button className="primary-action" disabled={!selectedTimelineId || clips.length === 0 || exporting} onClick={exportTimeline}>
+            {exporting ? "导出中..." : "导出整条时间线"}
+          </button>
+        </div>
+        <p className="material-output-dir">{outputDir || "未选择时默认保存到 data/exports"}</p>
+      </div>
+
+      <div className="material-mix-layout">
+        <section className="panel material-segment-picker">
+          <div className="section-title compact-title">
+            <div>
+              <h2>选择已有片段</h2>
+              <p>{filteredSegments.length} / {props.segments.length} 个片段</p>
+            </div>
+          </div>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索台词、来源或 tag..." />
+          <div className="material-segment-list">
+            {filteredSegments.map((segment) => (
+              <article className="material-segment-row" key={segment.id}>
+                <img src={`${API_BASE_URL}/segments/${segment.id}/thumbnail`} />
+                <div>
+                  <div className="segment-type-line">{splitMultiValue(segment.semantic_type).map((tag) => <TagChip key={tag} tag={tag} />)}</div>
+                  <strong>{formatClockPrecise(segment.start_seconds)} - {formatClockPrecise(segment.end_seconds)}</strong>
+                  <p>{segment.text || "无台词"}</p>
+                  <small>{segment.video_name}</small>
+                </div>
+                <button className="secondary" onClick={() => addClip(segment.id)}>添加</button>
+              </article>
+            ))}
+            {props.segments.length === 0 && <p className="empty material-empty-note">还没有可用语义片段，请先在“导入分析”完成视频转录和切片。</p>}
+            {props.segments.length > 0 && filteredSegments.length === 0 && <p className="empty">没有匹配搜索条件的片段。</p>}
+          </div>
+        </section>
+
+        <section className="panel material-timeline-panel">
+          <div className="section-title compact-title">
+            <div>
+              <h2>{selectedTimeline?.name ?? "时间线"}</h2>
+              <p>{clips.length} 个片段 · 单视频轨</p>
+            </div>
+          </div>
+          <div className="material-preview-box">
+            {previewSource ? (
+              <video
+                key={previewSource}
+                ref={timelinePreviewRef}
+                src={previewSource}
+                controls
+                preload="metadata"
+                onError={() => props.setError("素材混剪预览生成失败，可检查时间线是否为空或源视频是否还存在。")}
+              />
+            ) : (
+              <div className="material-preview-empty">
+                <strong>暂无预览</strong>
+                <span>从左侧添加片段后可预览和导出。</span>
+              </div>
+            )}
+          </div>
+          <div className="timeline-clip-list">
+            {clips.map((clip, index) => (
+              <article
+                className={clip.clip_id === selectedClipId ? "timeline-clip-card active" : "timeline-clip-card"}
+                key={clip.clip_id}
+                onClick={() => selectTimelineClip(clip)}
+              >
+                <span className="timeline-position">#{clip.position}</span>
+                <div>
+                  <div className="timeline-clip-meta">
+                    <TagChip tag={splitMultiValue(clip.semantic_type)[0] ?? clip.semantic_type} />
+                    <strong>{formatClockPrecise(clip.timeline_in)} - {formatClockPrecise(clip.timeline_out)}</strong>
+                    <span>{(clip.timeline_out - clip.timeline_in).toFixed(1)}s</span>
+                  </div>
+                  <p>{clip.text || "无台词"}</p>
+                  <small>{clip.video_name} · 源 {formatClockPrecise(clip.source_in)} - {formatClockPrecise(clip.source_out)}</small>
+                </div>
+                <div className="timeline-actions" onClick={(event) => event.stopPropagation()}>
+                  <button className="ghost-button" disabled={index === 0} onClick={() => patchClip(clip.clip_id, "move_up")}>上移</button>
+                  <button className="ghost-button" disabled={index === clips.length - 1} onClick={() => patchClip(clip.clip_id, "move_down")}>下移</button>
+                  <button className="danger-action" onClick={() => deleteClip(clip.clip_id)}>删除</button>
+                </div>
+              </article>
+            ))}
+            {clips.length === 0 && <p className="empty timeline-empty">从左侧选择片段添加到时间线。</p>}
+          </div>
+          <div className="clip-trim-panel">
+            {selectedClip ? (
+              <>
+                <div className="section-title compact-title">
+                  <div>
+                    <h2>当前片段微调</h2>
+                    <p>{selectedClip.video_name}</p>
+                  </div>
+                  <button className="primary-action" onClick={saveClipDraft}>保存</button>
+                </div>
+                <div className="material-clip-preview">
+                  <video
+                    key={clipPreviewSource}
+                    ref={clipPreviewRef}
+                    src={clipPreviewSource}
+                    controls
+                    preload="metadata"
+                    onLoadedMetadata={handleClipPreviewLoaded}
+                    onTimeUpdate={handleClipPreviewTimeUpdate}
+                    onError={() => props.setError("当前片段预览生成失败，可检查源视频是否还存在。")}
+                  />
+                </div>
+                <div className="micro-controls">
+                  <button onClick={() => nudgeClip("start", -0.1)}>入-</button>
+                  <button onClick={() => nudgeClip("start", 0.1)}>入+</button>
+                  <button onClick={() => nudgeClip("end", -0.1)}>出-</button>
+                  <button onClick={() => nudgeClip("end", 0.1)}>出+</button>
+                </div>
+                <div className="edit-grid compact">
+                  <label>开始秒
+                    <input type="number" step="0.1" value={clipDraft.source_in ?? selectedClip.source_in} onChange={(event) => setClipDraft((current) => ({ ...current, source_in: Number(event.target.value) }))} />
+                  </label>
+                  <label>结束秒
+                    <input type="number" step="0.1" value={clipDraft.source_out ?? selectedClip.source_out} onChange={(event) => setClipDraft((current) => ({ ...current, source_out: Number(event.target.value) }))} />
+                  </label>
+                </div>
+                <p className="clip-trim-caption">
+                  时间线 {formatClockPrecise(selectedClip.timeline_in)} - {formatClockPrecise(selectedClip.timeline_out)}
+                </p>
+              </>
+            ) : (
+              <p className="empty timeline-empty">选择时间线片段后可微调出入点。</p>
+            )}
+          </div>
+        </section>
+      </div>
+    </section>
+  );
 }
 
 function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRefresh: () => void; setError: (value: string) => void; setMessage: (value: string) => void }) {
