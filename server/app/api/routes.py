@@ -22,9 +22,11 @@ from app.services.workspace_store import (
     add_video,
     create_project,
     create_scheme_set,
+    delete_material_mix_timeline,
     delete_project,
     delete_segments,
     delete_scheme_segment,
+    duplicate_material_mix_timeline,
     get_project,
     get_scheme,
     get_segment,
@@ -43,6 +45,7 @@ from app.services.workspace_store import (
     list_videos,
     move_scheme_segment,
     split_segment,
+    update_material_mix_timeline,
     update_material_mix_clip,
     update_project,
     update_segment,
@@ -263,11 +266,24 @@ class MaterialMixTimelineCreateRequest(BaseModel):
     name: str = Field(default="素材混剪方案 01", min_length=1, max_length=80)
 
 
+class MaterialMixTimelineGenerateRequest(BaseModel):
+    project_id: int
+    requirement_prompt: str = Field(default="", max_length=3000)
+    target_clip_count: int = Field(default=8, ge=3, le=30)
+    prefer_distinct_sources: bool = True
+
+
+class MaterialMixTimelinePatchRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    is_favorite: bool | None = None
+
+
 class MaterialMixClipCreateRequest(BaseModel):
     segment_id: int
 
 
 class MaterialMixClipPatchRequest(BaseModel):
+    segment_id: int | None = None
     source_in: float | None = Field(default=None, ge=0)
     source_out: float | None = Field(default=None, gt=0)
     action: str | None = Field(default=None, pattern="^(move_up|move_down)$")
@@ -275,6 +291,151 @@ class MaterialMixClipPatchRequest(BaseModel):
 
 class MaterialMixExportRequest(BaseModel):
     output_dir: str | None = None
+
+
+MATERIAL_MIX_STRUCTURE = ["噱头引入", "痛点", "产品方案", "效果展示", "信任背书", "行动号召"]
+
+
+def _split_multi_value(value: object) -> list[str]:
+    return [item.strip() for item in str(value or "").replace("，", ",").replace("/", ",").split(",") if item.strip()]
+
+
+def _segment_duration(segment: dict[str, object]) -> float:
+    return max(0.0, float(segment.get("end_seconds") or 0) - float(segment.get("start_seconds") or 0))
+
+
+def _segment_has_tag(segment: dict[str, object], tag: str) -> bool:
+    return tag in _split_multi_value(segment.get("semantic_type"))
+
+
+def _is_time_near_same_video(candidate: dict[str, object], selected: list[dict[str, object]]) -> bool:
+    if not selected:
+        return False
+    previous = selected[-1]
+    if int(candidate.get("video_id") or 0) != int(previous.get("video_id") or 0):
+        return False
+    candidate_start = float(candidate.get("start_seconds") or 0)
+    previous_end = float(previous.get("end_seconds") or 0)
+    return abs(candidate_start - previous_end) < 1.2
+
+
+def _material_mix_score(
+    candidate: dict[str, object],
+    target_tag: str | None,
+    selected: list[dict[str, object]],
+    used_video_ids: set[int],
+    prefer_distinct_sources: bool,
+) -> float:
+    score = 0.0
+    if target_tag and _segment_has_tag(candidate, target_tag):
+        score += 100.0
+    duration = _segment_duration(candidate)
+    if 2.0 <= duration <= 8.0:
+        score += 12.0
+    elif 1.0 <= duration <= 12.0:
+        score += 6.0
+    if prefer_distinct_sources and int(candidate.get("video_id") or 0) not in used_video_ids:
+        score += 20.0
+    if _is_time_near_same_video(candidate, selected):
+        score -= 35.0
+    if selected and int(candidate.get("video_id") or 0) == int(selected[-1].get("video_id") or 0):
+        score -= 12.0
+    return score
+
+
+def _material_mix_note(
+    candidate: dict[str, object],
+    target_tag: str | None,
+    selected: list[dict[str, object]],
+    prefer_distinct_sources: bool,
+) -> str:
+    notes: list[str] = []
+    if target_tag and _segment_has_tag(candidate, target_tag):
+        notes.append(f"匹配「{target_tag}」")
+    elif target_tag:
+        notes.append(f"补齐「{target_tag}」结构位")
+    if prefer_distinct_sources and selected and int(candidate.get("video_id") or 0) != int(selected[-1].get("video_id") or 0):
+        notes.append("分散来源视频")
+    if selected and not _is_time_near_same_video(candidate, selected):
+        notes.append("避开相邻近时间片段")
+    duration = _segment_duration(candidate)
+    if 2.0 <= duration <= 8.0:
+        notes.append("时长适合硬切")
+    return "、".join(notes[:3]) or "可用片段补齐"
+
+
+def _pick_material_mix_segment(
+    segments: list[dict[str, object]],
+    selected: list[dict[str, object]],
+    target_tag: str | None,
+    prefer_distinct_sources: bool,
+) -> dict[str, object] | None:
+    used_ids = {int(item["id"]) for item in selected}
+    candidates = [item for item in segments if int(item["id"]) not in used_ids and _segment_duration(item) >= 0.3]
+    if target_tag:
+        tagged = [item for item in candidates if _segment_has_tag(item, target_tag)]
+        if tagged:
+            candidates = tagged
+    if not candidates:
+        return None
+    used_video_ids = {int(item.get("video_id") or 0) for item in selected}
+    return sorted(
+        candidates,
+        key=lambda item: (
+            _material_mix_score(item, target_tag, selected, used_video_ids, prefer_distinct_sources),
+            -float(item.get("start_seconds") or 0),
+        ),
+        reverse=True,
+    )[0]
+
+
+def _target_tags_from_requirement(requirement_prompt: str, target_clip_count: int) -> list[str]:
+    mentioned = [tag for tag in MATERIAL_MIX_STRUCTURE if tag in requirement_prompt]
+    base = mentioned or MATERIAL_MIX_STRUCTURE
+    if target_clip_count <= len(base):
+        return base[:target_clip_count]
+    tags = list(base)
+    index = 0
+    while len(tags) < target_clip_count:
+        tags.append(base[index % len(base)])
+        index += 1
+    return tags[:target_clip_count]
+
+
+def _select_material_mix_segments(
+    segments: list[dict[str, object]],
+    target_clip_count: int,
+    requirement_prompt: str,
+    prefer_distinct_sources: bool,
+) -> tuple[list[dict[str, object]], list[str], dict[int, str]]:
+    warnings: list[str] = []
+    selected: list[dict[str, object]] = []
+    notes: dict[int, str] = {}
+    count = min(max(3, target_clip_count), min(30, len(segments)))
+    if count < target_clip_count:
+        warnings.append(f"当前只有 {len(segments)} 个可用片段，已按可用数量生成。")
+    target_tags = _target_tags_from_requirement(requirement_prompt, count)
+
+    for tag in target_tags:
+        picked = _pick_material_mix_segment(segments, selected, tag, prefer_distinct_sources)
+        if picked is None:
+            warnings.append(f"缺少「{tag}」片段，已跳过这个结构位。")
+            continue
+        if not _segment_has_tag(picked, tag):
+            warnings.append(f"缺少「{tag}」片段，已用其他可用片段补齐。")
+        notes[int(picked["id"])] = _material_mix_note(picked, tag, selected, prefer_distinct_sources)
+        selected.append(picked)
+        if len(selected) >= count:
+            break
+
+    while len(selected) < count:
+        picked = _pick_material_mix_segment(segments, selected, None, prefer_distinct_sources)
+        if picked is None:
+            break
+        notes[int(picked["id"])] = _material_mix_note(picked, None, selected, prefer_distinct_sources)
+        selected.append(picked)
+
+    return selected, list(dict.fromkeys(warnings)), notes
 
 
 @router.get("/health")
@@ -763,9 +924,72 @@ def read_material_mix_timelines(project_id: int | None = None) -> list[dict[str,
     return list_material_mix_timelines(project_id)
 
 
+@router.post("/material-mix/timelines/generate")
+def generate_material_mix_timeline(payload: MaterialMixTimelineGenerateRequest) -> dict[str, object]:
+    project = get_project(payload.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    segments = list_segments(payload.project_id)
+    if not segments:
+        raise HTTPException(status_code=400, detail="当前项目还没有可用语义片段，请先在导入分析或片段库完成切片。")
+    selected_segments, warnings, generation_notes = _select_material_mix_segments(
+        segments,
+        payload.target_clip_count,
+        payload.requirement_prompt,
+        payload.prefer_distinct_sources,
+    )
+    if not selected_segments:
+        raise HTTPException(status_code=400, detail="没有找到可用于素材混剪的有效片段。")
+
+    timeline_index = len(list_material_mix_timelines(payload.project_id)) + 1
+    timeline = create_material_mix_timeline(payload.project_id, f"素材混剪自动方案 {timeline_index:02d}")
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    for segment in selected_segments:
+        next_timeline = add_material_mix_clip(int(timeline["id"]), int(segment["id"]))
+        if next_timeline is not None:
+            timeline = next_timeline
+    timeline = get_material_mix_timeline(int(timeline["id"])) or timeline
+    timeline["generation_warnings"] = warnings
+    timeline["generation_notes"] = {
+        int(clip["clip_id"]): generation_notes.get(int(clip["segment_id"]), "规则自动选择")
+        for clip in timeline.get("clips", [])
+    }
+    timeline["requirement_prompt"] = payload.requirement_prompt
+    return timeline
+
+
 @router.get("/material-mix/timelines/{timeline_id}")
 def read_material_mix_timeline(timeline_id: int) -> dict[str, object]:
     timeline = get_material_mix_timeline(timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found.")
+    return timeline
+
+
+@router.patch("/material-mix/timelines/{timeline_id}")
+def patch_material_mix_timeline(timeline_id: int, payload: MaterialMixTimelinePatchRequest) -> dict[str, object]:
+    timeline = update_material_mix_timeline(
+        timeline_id,
+        name=payload.name,
+        is_favorite=payload.is_favorite,
+    )
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found or invalid name.")
+    return timeline
+
+
+@router.delete("/material-mix/timelines/{timeline_id}")
+def remove_material_mix_timeline(timeline_id: int) -> dict[str, object]:
+    deleted = delete_material_mix_timeline(timeline_id)
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="Timeline not found.")
+    return deleted
+
+
+@router.post("/material-mix/timelines/{timeline_id}/duplicate")
+def duplicate_material_mix(timeline_id: int) -> dict[str, object]:
+    timeline = duplicate_material_mix_timeline(timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found.")
     return timeline
@@ -783,6 +1007,15 @@ def add_material_mix_timeline_clip(timeline_id: int, payload: MaterialMixClipCre
 
 @router.patch("/material-mix/timelines/{timeline_id}/clips/{clip_id}")
 def patch_material_mix_timeline_clip(timeline_id: int, clip_id: int, payload: MaterialMixClipPatchRequest) -> dict[str, object]:
+    if payload.segment_id is not None:
+        replacement = get_segment(payload.segment_id)
+        timeline = get_material_mix_timeline(timeline_id)
+        if timeline is None:
+            raise HTTPException(status_code=404, detail="Timeline not found.")
+        if replacement is None:
+            raise HTTPException(status_code=404, detail="Segment not found.")
+        if int(replacement["project_id"]) != int(timeline["project_id"]):
+            raise HTTPException(status_code=400, detail="替换片段不属于当前项目。")
     if payload.source_in is not None or payload.source_out is not None:
         timeline = get_material_mix_timeline(timeline_id)
         if timeline is None:
@@ -799,6 +1032,7 @@ def patch_material_mix_timeline_clip(timeline_id: int, clip_id: int, payload: Ma
     timeline = update_material_mix_clip(
         timeline_id,
         clip_id,
+        segment_id=payload.segment_id,
         source_in=payload.source_in,
         source_out=payload.source_out,
         action=payload.action,

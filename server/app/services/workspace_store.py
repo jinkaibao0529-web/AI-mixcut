@@ -115,6 +115,7 @@ def init_workspace_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
+                is_favorite INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(project_id) REFERENCES projects(id)
@@ -137,6 +138,7 @@ def init_workspace_db() -> None:
         )
         _ensure_column(connection, "projects", "category", "TEXT NOT NULL DEFAULT '默认'")
         _ensure_column(connection, "videos", "transcript_segments", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(connection, "material_mix_timelines", "is_favorite", "INTEGER NOT NULL DEFAULT 0")
         _seed_settings(connection)
 
 
@@ -675,11 +677,86 @@ def list_material_mix_timelines(project_id: int | None = None) -> list[dict[str,
             LEFT JOIN material_mix_clips c ON c.timeline_id = t.id
             {where}
             GROUP BY t.id
-            ORDER BY t.updated_at DESC, t.id DESC
+            ORDER BY t.is_favorite DESC, t.updated_at DESC, t.id DESC
             """,
             tuple(params),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def update_material_mix_timeline(
+    timeline_id: int,
+    *,
+    name: str | None = None,
+    is_favorite: bool | None = None,
+) -> dict[str, Any] | None:
+    init_workspace_db()
+    values: dict[str, Any] = {}
+    if name is not None:
+        clean_name = name.strip()
+        if not clean_name:
+            return None
+        values["name"] = clean_name
+    if is_favorite is not None:
+        values["is_favorite"] = 1 if is_favorite else 0
+    if not values:
+        return get_material_mix_timeline(timeline_id)
+    with get_connection() as connection:
+        row = connection.execute("SELECT project_id FROM material_mix_timelines WHERE id = ?", (timeline_id,)).fetchone()
+        if not row:
+            return None
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        connection.execute(
+            f"UPDATE material_mix_timelines SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (*values.values(), timeline_id),
+        )
+    touch_project(int(row["project_id"]))
+    return get_material_mix_timeline(timeline_id)
+
+
+def duplicate_material_mix_timeline(timeline_id: int) -> dict[str, Any] | None:
+    init_workspace_db()
+    source = get_material_mix_timeline(timeline_id)
+    if not source:
+        return None
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "INSERT INTO material_mix_timelines (project_id, name, is_favorite) VALUES (?, ?, 0)",
+            (int(source["project_id"]), f"{source['name']} 副本"),
+        )
+        new_timeline_id = int(cursor.lastrowid)
+        for clip in source["clips"]:
+            connection.execute(
+                """
+                INSERT INTO material_mix_clips (
+                    timeline_id, segment_id, source_path, source_in, source_out, track_type, position
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_timeline_id,
+                    int(clip["segment_id"]),
+                    str(clip["source_path"]),
+                    float(clip["source_in"]),
+                    float(clip["source_out"]),
+                    str(clip.get("track_type") or "video"),
+                    int(clip["position"]),
+                ),
+            )
+    touch_project(int(source["project_id"]))
+    return get_material_mix_timeline(new_timeline_id)
+
+
+def delete_material_mix_timeline(timeline_id: int) -> dict[str, Any] | None:
+    init_workspace_db()
+    with get_connection() as connection:
+        row = connection.execute("SELECT id, project_id FROM material_mix_timelines WHERE id = ?", (timeline_id,)).fetchone()
+        if not row:
+            return None
+        connection.execute("DELETE FROM material_mix_clips WHERE timeline_id = ?", (timeline_id,))
+        connection.execute("DELETE FROM material_mix_timelines WHERE id = ?", (timeline_id,))
+    touch_project(int(row["project_id"]))
+    return {"id": timeline_id, "project_id": int(row["project_id"])}
 
 
 def get_material_mix_timeline(timeline_id: int) -> dict[str, Any] | None:
@@ -764,6 +841,7 @@ def update_material_mix_clip(
     timeline_id: int,
     clip_id: int,
     *,
+    segment_id: int | None = None,
     source_in: float | None = None,
     source_out: float | None = None,
     action: str | None = None,
@@ -787,6 +865,15 @@ def update_material_mix_clip(
                 connection.execute("UPDATE material_mix_clips SET position = ? WHERE id = ?", (position, int(other["id"])))
         else:
             values: dict[str, Any] = {}
+            if segment_id is not None:
+                timeline = get_material_mix_timeline(timeline_id)
+                segment = get_segment(segment_id)
+                if not timeline or not segment or int(segment["project_id"]) != int(timeline["project_id"]):
+                    return None
+                values["segment_id"] = segment_id
+                values["source_path"] = str(segment["video_path"])
+                values["source_in"] = float(segment["start_seconds"])
+                values["source_out"] = float(segment["end_seconds"])
             if source_in is not None:
                 values["source_in"] = source_in
             if source_out is not None:

@@ -458,6 +458,12 @@ def create_timeline_clip_preview(clip: dict[str, object]) -> Path:
         raise VideoProcessingError(f"源视频文件不存在：{source_path}")
     source_in = float(clip["source_in"])
     source_out = float(clip["source_out"])
+    try:
+        source_duration = probe_duration(source_path)
+        source_out = min(source_out, source_duration)
+        source_in = min(source_in, max(0.0, source_duration - 0.3))
+    except VideoProcessingError:
+        pass
     if source_out - source_in < 0.3:
         raise VideoProcessingError("时间线片段至少保留 0.3 秒。")
     signature = hashlib.sha256(
