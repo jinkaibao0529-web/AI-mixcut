@@ -857,6 +857,120 @@ def _normalize_segments(items: list[Any], duration: float) -> list[dict[str, Any
     return normalized
 
 
+async def analyze_product_visual(segment: dict[str, Any], custom_tags: str = "") -> dict[str, Any]:
+    settings = get_settings(masked=False)
+    _require_ai_settings(settings)
+    tag_instruction = (
+        f"用户自定义 tag 词库：{custom_tags}。selling_points 和 visual_tags 必须优先从这些 tag 中选择；"
+        "只有画面确实需要且词库没有覆盖时，才允许补充少量新 tag。"
+        "这些用户自定义 tag 只能用于 selling_points 或 visual_tags，绝对不要用于 semantic_type；"
+        f"semantic_type 仍然只能属于系统大类：{'、'.join(SEGMENT_TYPES)}。"
+        if custom_tags.strip()
+        else "selling_points 和 visual_tags 请生成简短、可复用、适合后续素材匹配的 tag。"
+    )
+    prompt = (
+        "你是电商短视频产品镜头分析师。请根据已有镜头信息推断这个镜头适合表达的卖点。"
+        "只输出 JSON 对象，不要 Markdown。字段：visual_description, selling_points, visual_tags, "
+        "suitable_positions, recommended_usage。selling_points、visual_tags、suitable_positions 都是数组。"
+        f"{tag_instruction}"
+        "如果画面信息不足，请根据文件名、片段台词和当前描述保守生成可编辑的初始标签。"
+        f"\n视频名：{segment.get('video_name')}"
+        f"\n片段时间：{segment.get('start_seconds')} - {segment.get('end_seconds')}"
+        f"\n已有台词：{segment.get('text')}"
+        f"\n已有描述：{segment.get('visual_description')}"
+        f"\n已有语义 tag：{segment.get('semantic_type')}"
+    )
+    content = await _chat_completion(settings, prompt, json_mode=settings.get("ai_json_mode") == "true")
+    parsed = _loads_json(content)
+    if isinstance(parsed, list):
+        parsed = parsed[0] if parsed else {}
+    if not isinstance(parsed, dict):
+        raise ProviderError("AI 视觉分析结果格式不正确。")
+    return {
+        "visual_description": str(parsed.get("visual_description") or segment.get("visual_description") or "").strip(),
+        "selling_points": _string_list(parsed.get("selling_points")),
+        "visual_tags": _string_list(parsed.get("visual_tags")),
+        "suitable_positions": _string_list(parsed.get("suitable_positions")) or ["中间"],
+        "recommended_usage": str(parsed.get("recommended_usage") or "").strip(),
+    }
+
+
+async def generate_script_lines(*, source_text: str, product_context: str, source_type: str) -> list[dict[str, Any]]:
+    settings = get_settings(masked=False)
+    _require_ai_settings(settings)
+    prompt = (
+        "你是电商短视频口播编导。请把用户提供的文案或爆款结构，结合产品信息改写裂变为一版原创短视频口播。"
+        "只输出 JSON 对象，不要 Markdown，格式：{\"lines\":[...]}。"
+        "每句字段：line_index,text,semantic_type,selling_points,visual_needs,estimated_duration。"
+        f"semantic_type 只能取：{'、'.join(SEGMENT_TYPES)}。"
+        "selling_points 和 visual_needs 是数组。estimated_duration 用秒，按中文口播自然语速估算。"
+        "不要照搬平台原文，要保留结构并结合用户产品重写。"
+        f"\n来源类型：{source_type}"
+        f"\n产品信息：{product_context}"
+        f"\n输入文案或链接内容：{source_text}"
+    )
+    content = await _chat_completion(settings, prompt, json_mode=settings.get("ai_json_mode") == "true")
+    parsed = _loads_json(content)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("lines", [])
+    if not isinstance(parsed, list):
+        raise ProviderError("AI 文案结果格式不正确。")
+    return _normalize_script_lines(parsed)
+
+
+def fallback_script_lines(source_text: str) -> list[dict[str, Any]]:
+    parts = [item.strip() for item in re.split(r"[。！？!?；;\n]+", source_text) if item.strip()]
+    if not parts and source_text.strip():
+        parts = [source_text.strip()]
+    lines: list[dict[str, Any]] = []
+    for index, text in enumerate(parts[:30], start=1):
+        lines.append(
+            {
+                "line_index": index,
+                "text": text,
+                "semantic_type": SEGMENT_TYPES[min(index - 1, len(SEGMENT_TYPES) - 1)],
+                "selling_points": [],
+                "visual_needs": [],
+                "estimated_duration": round(max(1.5, len(text) / 5.2), 1),
+            }
+        )
+    return lines
+
+
+def _normalize_script_lines(items: list[Any]) -> list[dict[str, Any]]:
+    lines: list[dict[str, Any]] = []
+    for index, raw in enumerate(items, start=1):
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            continue
+        semantic_type = str(raw.get("semantic_type") or "过渡").strip()
+        if semantic_type not in SEGMENT_TYPES:
+            semantic_type = "过渡"
+        try:
+            estimated_duration = float(raw.get("estimated_duration") or max(1.5, len(text) / 5.2))
+        except (TypeError, ValueError):
+            estimated_duration = max(1.5, len(text) / 5.2)
+        lines.append(
+            {
+                "line_index": int(raw.get("line_index") or index),
+                "text": text,
+                "semantic_type": semantic_type,
+                "selling_points": _string_list(raw.get("selling_points")),
+                "visual_needs": _string_list(raw.get("visual_needs")),
+                "estimated_duration": round(max(0.8, estimated_duration), 1),
+            }
+        )
+    return lines
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value or "").replace("，", ",").replace("/", ",").split(",") if item.strip()]
+
+
 def _normalize_schemes(
     items: list[Any],
     available_segments: list[dict[str, Any]],

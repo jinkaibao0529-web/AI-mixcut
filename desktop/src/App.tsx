@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type KeyboardEvent, type RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -9,13 +9,14 @@ const SIDEBAR_CATEGORY_LIMIT = 4;
 const SCHEME_PREVIEW_START_GUARD_SECONDS = 0.06;
 const SCHEME_PREVIEW_END_GUARD_SECONDS = 0.02;
 
-type WorkspaceView = "workspace" | "overview" | "import" | "segments" | "materialMix" | "schemes" | "settings";
+type WorkspaceView = "workspace" | "overview" | "import" | "assets" | "scripts" | "voice" | "materialMix" | "schemes" | "subtitles" | "settings";
 
 type Project = {
   id: number;
   name: string;
   category: string;
   custom_prompt: string;
+  custom_tags: string;
   status: string;
   video_count: number;
   segment_count: number;
@@ -33,6 +34,12 @@ type VideoItem = {
   width: number;
   height: number;
   fps: number;
+  asset_type?: string;
+  source_mode?: string;
+  has_voice?: number;
+  has_bgm?: number;
+  has_captions?: number;
+  keep_original_audio?: number;
   transcript: string;
   transcript_segments?: string;
   status: string;
@@ -49,6 +56,68 @@ type Segment = {
   text: string;
   semantic_type: string;
   position_type: string;
+  visual_description?: string;
+  selling_points?: string;
+  visual_tags?: string;
+  source_mode?: string;
+  keep_original_audio?: number | boolean;
+};
+
+type Asset = {
+  id: number;
+  project_id?: number;
+  asset_type: string;
+  name: string;
+  file_path: string;
+  tags: string;
+  duration_seconds: number;
+  status: string;
+  metadata?: Record<string, unknown>;
+};
+
+type ScriptLine = {
+  line_index: number;
+  text: string;
+  semantic_type: string;
+  selling_points: string[];
+  visual_needs: string[];
+  estimated_duration: number;
+};
+
+type ScriptDraft = {
+  id: number;
+  project_id: number;
+  title: string;
+  source_type: string;
+  source_text: string;
+  product_context: string;
+  lines: ScriptLine[];
+  created_at: string;
+};
+
+type AiTask = {
+  id: number;
+  project_id?: number;
+  task_type: string;
+  target_type: string;
+  target_id: number;
+  status: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+  updated_at?: string;
+};
+
+type SubtitleStyleDraft = {
+  font: string;
+  size: number;
+  primary_color: string;
+  outline_color: string;
+  back_color: string;
+  bold: boolean;
+  outline: number;
+  shadow: number;
+  alignment: number;
+  margin_v: number;
 };
 
 type TranscriptSegment = {
@@ -97,8 +166,12 @@ type MaterialMixClip = {
   text: string;
   semantic_type: string;
   position_type: string;
+  selling_points?: string;
+  visual_tags?: string;
+  visual_description?: string;
   video_name: string;
   generation_note?: string;
+  selection_note?: string;
 };
 
 type MaterialMixTimeline = {
@@ -109,6 +182,13 @@ type MaterialMixTimeline = {
   duration_seconds: number;
   clip_count: number;
   is_favorite?: number | boolean;
+  voice_asset_id?: number;
+  bgm_asset_id?: number;
+  subtitle_preset_id?: number;
+  audio_policy?: string;
+  normalize_loudness?: number | boolean;
+  target_lufs?: number;
+  burn_subtitles?: number | boolean;
   updated_at?: string;
   clips?: MaterialMixClip[];
   generation_warnings?: string[];
@@ -176,6 +256,18 @@ function App() {
     void loadProjects();
     void loadSettings();
   }, []);
+
+  useEffect(() => {
+    if (!message) return;
+    const timer = window.setTimeout(() => setMessage(""), 3200);
+    return () => window.clearTimeout(timer);
+  }, [message]);
+
+  useEffect(() => {
+    if (!error) return;
+    const timer = window.setTimeout(() => setError(""), 5200);
+    return () => window.clearTimeout(timer);
+  }, [error]);
 
   useEffect(() => {
     if (activeProject && view !== "workspace" && view !== "settings") {
@@ -373,8 +465,20 @@ function App() {
       </aside>
 
       <section className="studio-main">
-        {message && <p className="notice">{message}</p>}
-        {error && <pre className="error panel">{error}</pre>}
+        {(message || error) && (
+          <div className="toast-stack" role="status" aria-live="polite">
+            {message && (
+              <button className="app-toast success" onClick={() => setMessage("")}>
+                {message}
+              </button>
+            )}
+            {error && (
+              <button className="app-toast error-toast" onClick={() => setError("")}>
+                {error}
+              </button>
+            )}
+          </div>
+        )}
 
         {view === "settings" ? (
           <SettingsView settings={settings} onSaved={loadSettings} setMessage={setMessage} setError={setError} />
@@ -414,7 +518,9 @@ function App() {
                 setError={setError}
               />
             )}
-            {view === "segments" && <SegmentLibrary segments={segments} videos={videos} onRefresh={() => loadProjectData(activeProject.id)} setError={setError} setMessage={setMessage} />}
+            {view === "assets" && <AssetWorkspace project={activeProject} segments={segments} videos={videos} onRefresh={() => loadProjectData(activeProject.id)} setError={setError} setMessage={setMessage} />}
+            {view === "scripts" && <ScriptWorkspace project={activeProject} setError={setError} setMessage={setMessage} />}
+            {view === "voice" && <VoiceWorkspace project={activeProject} setError={setError} setMessage={setMessage} />}
             {view === "materialMix" && (
               <MaterialMixWorkspace
                 project={activeProject}
@@ -423,6 +529,7 @@ function App() {
                 setError={setError}
               />
             )}
+            {view === "subtitles" && <SubtitleWorkspace project={activeProject} setError={setError} setMessage={setMessage} />}
             {view === "schemes" && (
               <SchemeWorkspace
                 project={activeProject}
@@ -590,9 +697,12 @@ function ProjectHeader(props: { project: Project; view: WorkspaceView; setView: 
   const tabs: Array<[WorkspaceView, string]> = [
     ["overview", "概览"],
     ["import", "导入分析"],
-    ["segments", "片段库"],
+    ["assets", "素材库"],
+    ["scripts", "文案中心"],
+    ["voice", "配音/BGM"],
     ["materialMix", "素材混剪"],
     ["schemes", "混剪方案"],
+    ["subtitles", "字幕模板"],
   ];
   return (
     <header className="project-header">
@@ -612,22 +722,44 @@ function ProjectHeader(props: { project: Project; view: WorkspaceView; setView: 
 }
 
 function Overview(props: { project: Project; videos: VideoItem[]; segments: Segment[]; schemes: Scheme[] }) {
+  const [previewVideo, setPreviewVideo] = useState<VideoItem | null>(null);
   return (
-    <section className="overview-grid">
-      <MetricCard label="视频" value={props.videos.length} />
-      <MetricCard label="语义片段" value={props.segments.length} />
-      <MetricCard label="混剪方案" value={props.schemes.length} />
-      <div className="panel overview-panel">
-        <h2>最近视频</h2>
-        {props.videos.slice(0, 5).map((video) => (
-          <div className="compact-row" key={video.id}>
-            <span>{video.name}</span>
-            <strong>{video.status}</strong>
-          </div>
-        ))}
-        {props.videos.length === 0 && <p className="empty">还没有导入视频。</p>}
-      </div>
-    </section>
+    <>
+      <section className="overview-grid">
+        <MetricCard label="视频" value={props.videos.length} />
+        <MetricCard label="语义片段" value={props.segments.length} />
+        <MetricCard label="混剪方案" value={props.schemes.length} />
+        <div className="panel overview-panel">
+          <h2>最近视频</h2>
+          {props.videos.slice(0, 5).map((video) => (
+            <button className="compact-row overview-video-row" key={video.id} onClick={() => setPreviewVideo(video)}>
+              <span>{video.name}</span>
+              <strong>{statusLabel(video.status)}</strong>
+            </button>
+          ))}
+          {props.videos.length === 0 && <p className="empty">还没有导入视频。</p>}
+        </div>
+      </section>
+      {previewVideo && (
+        <div className="modal-backdrop" onClick={() => setPreviewVideo(null)}>
+          <section className="video-preview-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="split-head">
+              <div>
+                <h2>{previewVideo.name}</h2>
+                <p>{previewVideo.width}x{previewVideo.height} · {previewVideo.duration_seconds.toFixed(1)}s · {statusLabel(previewVideo.status)}</p>
+              </div>
+              <button className="secondary" onClick={() => setPreviewVideo(null)}>关闭</button>
+            </div>
+            <video
+              src={`${API_BASE_URL}/videos/${previewVideo.id}/preview`}
+              poster={`${API_BASE_URL}/videos/${previewVideo.id}/thumbnail`}
+              controls
+              autoPlay
+            />
+          </section>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -648,29 +780,55 @@ function ImportAnalyze(props: {
   setMessage: (value: string) => void;
   setError: (value: string) => void;
 }) {
-  const [files, setFiles] = useState<File[]>([]);
+  const finishedFileInputRef = useRef<HTMLInputElement | null>(null);
+  const looseFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [customTagDraft, setCustomTagDraft] = useState(props.project.custom_tags ?? "");
+  const [showBgmDialog, setShowBgmDialog] = useState(false);
+  const [selectedBgmVideoIds, setSelectedBgmVideoIds] = useState<number[]>([]);
   const [importing, setImporting] = useState(false);
+  const [assetImporting, setAssetImporting] = useState(false);
+  const [batchTaggingBusy, setBatchTaggingBusy] = useState(false);
+  const [finishedBatchBusy, setFinishedBatchBusy] = useState(false);
+  const [taggingSegmentId, setTaggingSegmentId] = useState<number | null>(null);
   const [reanalyzingId, setReanalyzingId] = useState<number | null>(null);
+  const productSegments = props.segments.filter((segment) => segment.source_mode === "product_assets" || !segment.text);
+  const finishedVideos = props.videos.filter((video) => video.asset_type === "finished_video" || !video.asset_type);
 
-  async function uploadVideo() {
-    if (files.length === 0) {
+  useEffect(() => {
+    setCustomTagDraft(props.project.custom_tags ?? "");
+  }, [props.project.id, props.project.custom_tags]);
+
+  async function uploadVideo(selectedFiles: File[]) {
+    if (selectedFiles.length === 0) {
       props.setError("请先选择一个或多个视频。");
       return;
     }
     const formData = new FormData();
-    files.forEach((file) => formData.append("files", file));
+    selectedFiles.forEach((file) => formData.append("files", file));
     setImporting(true);
     try {
-      await fetch(`${API_BASE_URL}/projects/${props.project.id}/videos/import`, { method: "POST", body: formData }).then(async (response) => {
+      const imported = await fetch(`${API_BASE_URL}/projects/${props.project.id}/videos/import`, { method: "POST", body: formData }).then(async (response) => {
         if (!response.ok) throw new Error((await response.json()).detail ?? "导入失败");
+        return response.json() as Promise<VideoItem[]>;
       });
-      setFiles([]);
-      props.setMessage(`已导入 ${files.length} 个视频，后台正在自动转录和切分。`);
+      props.setMessage(`已导入 ${selectedFiles.length} 个成片，后台正在自动转录和切分。`);
       props.onRefresh();
     } catch (err) {
       props.setError(err instanceof Error ? err.message : "未知错误");
     } finally {
       setImporting(false);
+    }
+  }
+
+  function openFinishedFilePicker() {
+    finishedFileInputRef.current?.click();
+  }
+
+  function handleFinishedFilesSelected(event: ChangeEvent<HTMLInputElement>) {
+    const selectedFiles = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (selectedFiles.length > 0) {
+      void uploadVideo(selectedFiles);
     }
   }
 
@@ -687,69 +845,311 @@ function ImportAnalyze(props: {
     }
   }
 
+  async function reanalyzeFinishedBatch() {
+    if (finishedVideos.length === 0) {
+      props.setError("还没有可重新分析的成片。");
+      return;
+    }
+    setFinishedBatchBusy(true);
+    try {
+      await Promise.all(finishedVideos.map((video) => api<VideoItem>(`/videos/${video.id}/reanalyze`, { method: "POST" })));
+      props.setMessage(`已为 ${finishedVideos.length} 个成片重新创建分析任务。`);
+      props.onRefresh();
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "成片批量重新分析失败");
+    } finally {
+      setFinishedBatchBusy(false);
+    }
+  }
+
+  async function uploadLooseAssets(selectedFiles: File[]) {
+    if (selectedFiles.length === 0) {
+      props.setError("请先选择零散素材文件。");
+      return;
+    }
+    const formData = new FormData();
+    selectedFiles.forEach((file) => formData.append("files", file));
+    setAssetImporting(true);
+    try {
+      await fetch(`${API_BASE_URL}/projects/${props.project.id}/assets/import?asset_type=product_shot`, { method: "POST", body: formData }).then(async (response) => {
+        if (!response.ok) throw new Error((await response.json()).detail ?? "导入失败");
+      });
+      if (customTagDraft.trim() !== (props.project.custom_tags ?? "").trim()) {
+        await saveCustomTags(false);
+      }
+      const result = await api<{ analyzed_count: number; error_count: number }>("/projects/" + props.project.id + "/segments/analyze-visual", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: Math.max(20, selectedFiles.length), only_missing: true }),
+      });
+      props.setMessage(`零散素材已导入并自动分析 ${result.analyzed_count} 个镜头${result.error_count ? `，${result.error_count} 个失败` : ""}。`);
+      props.onRefresh();
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "零散素材导入失败");
+    } finally {
+      setAssetImporting(false);
+    }
+  }
+
+  function openLooseFilePicker() {
+    const hasTag = customTagDraft.trim().length > 0 || String(props.project.custom_tags ?? "").trim().length > 0;
+    if (!hasTag) {
+      const shouldContinue = window.confirm("建议先录入产品卖点/画面 tag，AI 识别会更精准。仍然继续导入吗？");
+      if (!shouldContinue) return;
+    }
+    looseFileInputRef.current?.click();
+  }
+
+  function handleLooseFilesSelected(event: ChangeEvent<HTMLInputElement>) {
+    const selectedFiles = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (selectedFiles.length > 0) {
+      void uploadLooseAssets(selectedFiles);
+    }
+  }
+
+  async function analyzeVisual(segmentId: number) {
+    setTaggingSegmentId(segmentId);
+    try {
+      await api(`/segments/${segmentId}/analyze-visual`, { method: "POST" });
+      props.setMessage("已生成产品镜头卖点 tag。");
+      props.onRefresh();
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "视觉打标失败");
+    } finally {
+      setTaggingSegmentId(null);
+    }
+  }
+
+  async function analyzeProductBatch() {
+    setBatchTaggingBusy(true);
+    try {
+      const result = await api<{ analyzed_count: number; error_count: number }>("/projects/" + props.project.id + "/segments/analyze-visual", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: 20, only_missing: true }),
+      });
+      props.setMessage(`已批量分析 ${result.analyzed_count} 个产品镜头${result.error_count ? `，${result.error_count} 个失败` : ""}。`);
+      props.onRefresh();
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "批量视觉打标失败");
+    } finally {
+      setBatchTaggingBusy(false);
+    }
+  }
+
+  async function saveCustomTags(showMessage = true) {
+    try {
+      await api<Project>(`/projects/${props.project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ custom_tags: customTagDraft }),
+      });
+      if (showMessage) {
+        props.setMessage("自定义 AI 打标 tag 已保存，后续 AI 打标会优先使用这些 tag。");
+      }
+      props.onRefresh();
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "自定义 tag 保存失败");
+    }
+  }
+
+  async function requestRemoveBgm(videoId: number, showMessage = true) {
+    try {
+      const result = await api<{ message: string }>("/audio/remove-bgm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ video_id: videoId }),
+      });
+      if (showMessage) {
+        props.setMessage(result.message);
+      }
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "去 BGM 任务创建失败");
+    }
+  }
+
+  function toggleBgmVideo(videoId: number) {
+    setSelectedBgmVideoIds((current) => (
+      current.includes(videoId) ? current.filter((id) => id !== videoId) : [...current, videoId]
+    ));
+  }
+
+  async function removeBgmForSelectedVideos() {
+    if (selectedBgmVideoIds.length === 0) {
+      props.setError("请先选择需要消除 BGM 的成片。");
+      return;
+    }
+    await Promise.all(selectedBgmVideoIds.map((videoId) => requestRemoveBgm(videoId, false)));
+    props.setMessage(`已为 ${selectedBgmVideoIds.length} 个成片创建消除 BGM 任务。`);
+    setSelectedBgmVideoIds([]);
+    setShowBgmDialog(false);
+  }
+
   return (
     <>
-      <div className="view-sticky-head import-sticky-head">
-        <section className="panel upload-panel">
-          <div className="upload-field">
-            <label>导入视频</label>
-            <input
-              id="video-file-input"
-              className="file-input-hidden"
-              type="file"
-              accept="video/*"
-              multiple
-              onChange={(event) => setFiles(Array.from(event.target.files ?? []))}
-            />
-            <div className="file-picker-row">
-              <label className="file-picker-button" htmlFor="video-file-input">选择视频文件</label>
-              <p className={files.length > 0 ? "file-picker-status active" : "file-picker-status"}>
-                {files.length > 0 ? `已选择 ${files.length} 个视频，导入后会自动转录和语义切分。` : "未选择文件"}
-              </p>
+      <section className="import-mode-grid">
+        <div className="panel import-mode-panel finished-import-panel">
+          <div className="section-title compact-title">
+            <div>
+              <h2>成片导入拆分</h2>
+              <p>导入带口播成片，自动 ASR、语义切分、打大类 tag。</p>
+            </div>
+            <div className="import-primary-actions">
+              <button className="secondary" disabled={finishedVideos.length === 0} onClick={() => setShowBgmDialog(true)}>消除 BGM</button>
+              <button className="secondary" disabled={finishedBatchBusy || finishedVideos.length === 0} onClick={reanalyzeFinishedBatch}>
+                {finishedBatchBusy ? "分析中..." : "重新批量分析"}
+              </button>
+              <button className="primary-action" disabled={importing} onClick={openFinishedFilePicker}>
+                {importing ? "导入中..." : "导入并自动分析"}
+              </button>
             </div>
           </div>
-          <button className="primary-action" disabled={importing} onClick={uploadVideo}>
-            {importing ? "导入中..." : "自动分析"}
-          </button>
-        </section>
-      </div>
+          <input
+            ref={finishedFileInputRef}
+            className="file-input-hidden"
+            type="file"
+            accept="video/*"
+            multiple
+            onChange={handleFinishedFilesSelected}
+          />
+          <section className="inline-result-section">
+            <div className="video-grid compact-video-grid">
+              {finishedVideos.map((video) => {
+                const videoSegments = props.segments.filter((segment) => segment.video_id === video.id);
+                const timestamped = hasTranscriptSegments(video);
+                return (
+                  <article className="video-card" key={video.id}>
+                    <div className="video-preview-stack">
+                      <video
+                        src={`${API_BASE_URL}/videos/${video.id}/preview`}
+                        poster={`${API_BASE_URL}/videos/${video.id}/thumbnail`}
+                        controls
+                        preload="metadata"
+                      />
+                      <VideoSegmentSummary segments={videoSegments} transcript={video.transcript} />
+                    </div>
+                    <div>
+                      <div className="video-card-header">
+                        <div>
+                          <h2>{video.name}</h2>
+                          <p>{video.width}x{video.height} · {video.duration_seconds.toFixed(1)}s · {statusLabel(video.status)}</p>
+                        </div>
+                        <button className="ghost-button" disabled={reanalyzingId === video.id} onClick={() => reanalyzeVideo(video.id)}>
+                          {reanalyzingId === video.id ? "分析中..." : "重新分析"}
+                        </button>
+                      </div>
+                      {video.status === "segmented" && !timestamped && (
+                        <p className="field-hint warning-hint">当前视频没有 ASR 时间戳，片段边界为估算结果；重新分析后会更准。</p>
+                      )}
+                      {video.error_message && <p className="error">{video.error_message}</p>}
+                      {["transcribing", "segmenting", "imported", "transcribed"].includes(video.status) && <div className="progress-strip"><span /></div>}
+                      <VideoScriptList segments={videoSegments} />
+                    </div>
+                  </article>
+                );
+              })}
+              {finishedVideos.length === 0 && <p className="empty panel">还没有成片分析结果。</p>}
+            </div>
+          </section>
+        </div>
 
-      <section className="video-grid">
-        {props.videos.map((video) => {
-          const videoSegments = props.segments.filter((segment) => segment.video_id === video.id);
-          const timestamped = hasTranscriptSegments(video);
-          return (
-            <article className="video-card" key={video.id}>
-              <div className="video-preview-stack">
-                <video
-                  src={`${API_BASE_URL}/videos/${video.id}/preview`}
-                  poster={`${API_BASE_URL}/videos/${video.id}/thumbnail`}
-                  controls
-                  preload="metadata"
+        <div className="panel import-mode-panel loose-import-panel">
+          <div className="section-title compact-title">
+            <div>
+              <h2>导入零散素材并自动分析</h2>
+              <p>先输入产品卖点 tag，再导入产品展示、权益镜头或真人口播，AI 会按这些 tag 辅助识别。</p>
+            </div>
+            <div className="import-primary-actions">
+              <div className="inline-tag-vocab">
+                <TagInputChips
+                  value={customTagDraft}
+                  onChange={setCustomTagDraft}
+                  placeholder="卖点/画面 tag"
                 />
-                <VideoSegmentSummary segments={videoSegments} transcript={video.transcript} />
+                <button className="secondary" onClick={() => saveCustomTags()}>保存</button>
               </div>
-              <div>
-                <div className="video-card-header">
-                  <div>
-                    <h2>{video.name}</h2>
-                    <p>{video.width}x{video.height} · {video.duration_seconds.toFixed(1)}s · {statusLabel(video.status)}</p>
+              <button className="secondary" disabled={batchTaggingBusy || productSegments.length === 0} onClick={analyzeProductBatch}>
+                {batchTaggingBusy ? "分析中..." : "重新批量分析"}
+              </button>
+              <button className="primary-action" disabled={assetImporting} onClick={openLooseFilePicker}>
+                {assetImporting ? "分析中..." : "导入并自动分析"}
+              </button>
+            </div>
+          </div>
+          <input
+            ref={looseFileInputRef}
+            className="file-input-hidden"
+            type="file"
+            accept="video/*"
+            multiple
+            onChange={handleLooseFilesSelected}
+          />
+          <div className="product-tagging-card inline-result-section">
+            <div className="video-grid compact-video-grid">
+              {productSegments.slice(0, 8).map((segment) => (
+                <article className="video-card product-preview-card" key={segment.id}>
+                  <div className="video-preview-stack">
+                    <video
+                      src={`${API_BASE_URL}/segments/${segment.id}/preview`}
+                      poster={`${API_BASE_URL}/segments/${segment.id}/thumbnail`}
+                      controls
+                      preload="metadata"
+                    />
                   </div>
-                  <button className="ghost-button" disabled={reanalyzingId === video.id} onClick={() => reanalyzeVideo(video.id)}>
-                    {reanalyzingId === video.id ? "分析中..." : "重新分析"}
-                  </button>
-                </div>
-                {video.status === "segmented" && !timestamped && (
-                  <p className="field-hint warning-hint">当前视频没有 ASR 时间戳，片段边界为估算结果；重新分析后会更准。</p>
-                )}
-                {video.error_message && <p className="error">{video.error_message}</p>}
-                {["transcribing", "segmenting", "imported", "transcribed"].includes(video.status) && <div className="progress-strip"><span /></div>}
-                <VideoScriptList segments={videoSegments} />
-              </div>
-            </article>
-          );
-        })}
+                  <div>
+                    <div className="video-card-header">
+                      <div>
+                        <h2>{segment.video_name}</h2>
+                        <p>{formatClockPrecise(segment.start_seconds)} - {formatClockPrecise(segment.end_seconds)}</p>
+                      </div>
+                      <button className="secondary" disabled={taggingSegmentId === segment.id} onClick={() => analyzeVisual(segment.id)}>
+                        {taggingSegmentId === segment.id ? "打标中..." : "AI 打标"}
+                      </button>
+                    </div>
+                    <p>{segment.visual_description || "待分析"}</p>
+                    <div className="tag-line"><CompactTagChips values={[...splitMultiValue(segment.selling_points), ...splitMultiValue(segment.visual_tags)]} limit={3} /></div>
+                  </div>
+                </article>
+              ))}
+              {productSegments.length === 0 && <p className="empty">导入产品展示/权益镜头后会出现在这里。</p>}
+            </div>
+          </div>
+        </div>
       </section>
+      {showBgmDialog && (
+        <div className="modal-backdrop" onClick={() => setShowBgmDialog(false)}>
+          <section className="bgm-select-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="split-head">
+              <div>
+                <h2>消除 BGM</h2>
+                <p>勾选需要创建人声/BGM 分离任务的成片。</p>
+              </div>
+              <button className="secondary" onClick={() => setShowBgmDialog(false)}>关闭</button>
+            </div>
+            <label className="checkbox-line compact-check bgm-select-all">
+              <input
+                checked={finishedVideos.length > 0 && selectedBgmVideoIds.length === finishedVideos.length}
+                onChange={(event) => setSelectedBgmVideoIds(event.target.checked ? finishedVideos.map((video) => video.id) : [])}
+                type="checkbox"
+              />
+              全选
+            </label>
+            <div className="bgm-select-list">
+              {finishedVideos.map((video) => (
+                <label className="checkbox-line compact-check" key={video.id}>
+                  <input checked={selectedBgmVideoIds.includes(video.id)} onChange={() => toggleBgmVideo(video.id)} type="checkbox" />
+                  <span>{video.name}</span>
+                </label>
+              ))}
+            </div>
+            <div className="modal-actions">
+              <button className="secondary" onClick={() => setShowBgmDialog(false)}>取消</button>
+              <button className="primary-action" disabled={selectedBgmVideoIds.length === 0} onClick={removeBgmForSelectedVideos}>创建任务 {selectedBgmVideoIds.length}</button>
+            </div>
+          </section>
+        </div>
+      )}
     </>
   );
 }
@@ -791,9 +1191,18 @@ function VideoSegmentSummary(props: { segments: Segment[]; transcript: string })
       </div>
       {orderedTags.length > 0 ? (
         <div className="tag-counts">
-          {orderedTags.map(([tag, count]) => (
+          {orderedTags.slice(0, 3).map(([tag, count]) => (
             <span className={`tag-chip tag-count-chip ${tagColorClass(tag)}`} key={tag}>{tag} {count}</span>
           ))}
+          {orderedTags.length > 3 && (
+            <span
+              className="tag-chip tag-color-default tag-overflow-chip"
+              data-overflow={orderedTags.slice(3).map(([tag, count]) => `${tag} ${count}`).join(" / ")}
+              title={orderedTags.slice(3).map(([tag, count]) => `${tag} ${count}`).join(" / ")}
+            >
+              ...
+            </span>
+          )}
         </div>
       ) : (
         <p className="empty">自动分析完成后会显示 tag 统计。</p>
@@ -825,6 +1234,530 @@ function VideoScriptList(props: { segments: Segment[] }) {
         </div>
       ))}
     </div>
+  );
+}
+
+function AssetWorkspace(props: { project: Project; segments: Segment[]; videos: VideoItem[]; onRefresh: () => void; setError: (value: string) => void; setMessage: (value: string) => void }) {
+  return (
+    <section className="asset-segment-library">
+      <SegmentLibrary segments={props.segments} videos={props.videos} onRefresh={props.onRefresh} setError={props.setError} setMessage={props.setMessage} />
+    </section>
+  );
+}
+
+function ScriptWorkspace(props: { project: Project; setError: (value: string) => void; setMessage: (value: string) => void }) {
+  const [scripts, setScripts] = useState<ScriptDraft[]>([]);
+  const [voiceAssets, setVoiceAssets] = useState<Asset[]>([]);
+  const [bgmAssets, setBgmAssets] = useState<Asset[]>([]);
+  const [selectedVoiceByScript, setSelectedVoiceByScript] = useState<Record<number, string>>({});
+  const [selectedBgmId, setSelectedBgmId] = useState("");
+  const [voiceBusyScriptId, setVoiceBusyScriptId] = useState<number | null>(null);
+  const [editingScriptId, setEditingScriptId] = useState<number | null>(null);
+  const [scriptDrafts, setScriptDrafts] = useState<Record<number, ScriptDraft>>({});
+  const [sourceText, setSourceText] = useState("");
+  const [productContext, setProductContext] = useState("");
+  const [douyinUrl, setDouyinUrl] = useState("");
+  const [scriptQuery, setScriptQuery] = useState("");
+  const [scriptSourceFilter, setScriptSourceFilter] = useState("");
+  const [busy, setBusy] = useState(false);
+  const filteredScripts = scripts.filter((script) => {
+    const sourceMatches = !scriptSourceFilter || script.source_type === scriptSourceFilter;
+    const haystack = `${script.title} ${script.source_type} ${script.lines.map((line) => `${line.text} ${line.semantic_type} ${line.selling_points.join(" ")} ${line.visual_needs.join(" ")}`).join(" ")}`.toLowerCase();
+    return sourceMatches && (!scriptQuery.trim() || haystack.includes(scriptQuery.trim().toLowerCase()));
+  });
+  const scriptSourceCounts = scripts.reduce<Record<string, number>>((counts, script) => {
+    counts[script.source_type] = (counts[script.source_type] ?? 0) + 1;
+    return counts;
+  }, {});
+  const scriptKeywordSummary = Array.from(scripts.reduce<Map<string, number>>((groups, script) => {
+    script.lines.forEach((line) => {
+      [...line.selling_points, ...line.visual_needs].forEach((tag) => {
+        const trimmed = tag.trim();
+        if (trimmed) groups.set(trimmed, (groups.get(trimmed) ?? 0) + 1);
+      });
+    });
+    return groups;
+  }, new Map()).entries()).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0])).slice(0, 10);
+  useEffect(() => {
+    void loadScripts();
+    void loadScriptAssets();
+  }, [props.project.id]);
+
+  async function loadScripts() {
+    try {
+      setScripts(await api<ScriptDraft[]>(`/projects/${props.project.id}/scripts`));
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "文案加载失败");
+    }
+  }
+
+  async function loadScriptAssets() {
+    try {
+      const [voices, bgms] = await Promise.all([
+        api<Asset[]>(`/projects/${props.project.id}/assets?asset_type=voice`),
+        api<Asset[]>(`/projects/${props.project.id}/assets?asset_type=bgm`),
+      ]);
+      setVoiceAssets(voices);
+      setBgmAssets(bgms);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "声音素材加载失败");
+    }
+  }
+
+  async function generate(kind: "manual" | "douyin") {
+    setBusy(true);
+    try {
+      const script = await api<ScriptDraft>(kind === "manual" ? "/scripts/generate-variants" : "/scripts/from-douyin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(kind === "manual"
+          ? { project_id: props.project.id, source_text: sourceText, product_context: productContext, title: "AI 裂变文案" }
+          : { project_id: props.project.id, douyin_url: douyinUrl, extracted_text: sourceText, product_context: productContext }),
+      });
+      props.setMessage(`已生成文案：${script.title}`);
+      await loadScripts();
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "文案生成失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function generateVoiceForScript(script: ScriptDraft) {
+    const text = script.lines.map((line) => line.text).join("\n");
+    if (!text.trim()) {
+      props.setError("这个文案没有可用于配音的句子。");
+      return;
+    }
+    setVoiceBusyScriptId(script.id);
+    try {
+      const asset = await api<Asset>("/tts/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: props.project.id, text, title: `${script.title} 配音`, script_id: script.id }),
+      });
+      setVoiceAssets((current) => [asset, ...current.filter((item) => item.id !== asset.id)]);
+      setSelectedVoiceByScript((current) => ({ ...current, [script.id]: String(asset.id) }));
+      props.setMessage(`已生成文案配音：${asset.name}`);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "文案配音生成失败");
+    } finally {
+      setVoiceBusyScriptId(null);
+    }
+  }
+
+  async function generateTimeline(script: ScriptDraft) {
+    try {
+      const timeline = await api<MaterialMixTimeline>("/timelines/generate-from-voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: props.project.id,
+          script_id: script.id,
+          voice_asset_id: selectedVoiceByScript[script.id] ? Number(selectedVoiceByScript[script.id]) : undefined,
+          bgm_asset_id: selectedBgmId ? Number(selectedBgmId) : undefined,
+          name: `${script.title} 成片`,
+        }),
+      });
+      props.setMessage(`已按文案语义生成时间线：${timeline.name}`);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "生成时间线失败");
+    }
+  }
+
+  function startEditScript(script: ScriptDraft) {
+    setEditingScriptId(script.id);
+    setScriptDrafts((current) => ({ ...current, [script.id]: structuredClone(script) }));
+  }
+
+  function updateScriptDraft(scriptId: number, updater: (script: ScriptDraft) => ScriptDraft) {
+    setScriptDrafts((current) => {
+      const source = current[scriptId] ?? scripts.find((script) => script.id === scriptId);
+      if (!source) return current;
+      return { ...current, [scriptId]: updater(structuredClone(source)) };
+    });
+  }
+
+  async function saveScriptDraft(scriptId: number) {
+    const draft = scriptDrafts[scriptId];
+    if (!draft) return;
+    try {
+      const updated = await api<ScriptDraft>(`/scripts/${scriptId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: draft.title,
+          source_text: draft.source_text,
+          product_context: draft.product_context,
+          lines: draft.lines,
+        }),
+      });
+      setScripts((current) => current.map((script) => (script.id === updated.id ? updated : script)));
+      setEditingScriptId(null);
+      props.setMessage("文案已保存，后续配音和时间线会使用修改后的版本。");
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "保存文案失败");
+    }
+  }
+
+  function updateScriptLine(scriptId: number, lineIndex: number, values: Partial<ScriptLine>) {
+    updateScriptDraft(scriptId, (script) => ({
+      ...script,
+      lines: script.lines.map((line, index) => (
+        index === lineIndex ? { ...line, ...values } : line
+      )),
+    }));
+  }
+
+  function addScriptLine(scriptId: number) {
+    updateScriptDraft(scriptId, (script) => ({
+      ...script,
+      lines: [
+        ...script.lines,
+        {
+          line_index: script.lines.length + 1,
+          text: "",
+          semantic_type: "过渡",
+          selling_points: [],
+          visual_needs: [],
+          estimated_duration: 2,
+        },
+      ],
+    }));
+  }
+
+  function removeScriptLine(scriptId: number, lineIndex: number) {
+    updateScriptDraft(scriptId, (script) => ({
+      ...script,
+      lines: script.lines
+        .filter((_, index) => index !== lineIndex)
+        .map((line, index) => ({ ...line, line_index: index + 1 })),
+    }));
+  }
+
+  return (
+    <section className="scheme-layout">
+      <section className="panel generation-panel">
+        <h2>文案中心</h2>
+        <label>产品信息</label>
+        <textarea rows={5} value={productContext} onChange={(event) => setProductContext(event.target.value)} placeholder="产品卖点、人群、价格权益、禁用词..." />
+        <label>手动文案 / 抖音拆解文本</label>
+        <textarea rows={8} value={sourceText} onChange={(event) => setSourceText(event.target.value)} placeholder="粘贴基础文案；如果是抖音链接，也可以先粘贴识别出的原文案。" />
+        <label>抖音链接</label>
+        <input value={douyinUrl} onChange={(event) => setDouyinUrl(event.target.value)} placeholder="用于记录来源和结构改写" />
+        <div className="action-row">
+          <button className="primary-action" disabled={busy || !sourceText.trim()} onClick={() => generate("manual")}>手动文案裂变</button>
+          <button className="secondary" disabled={busy || !douyinUrl.trim()} onClick={() => generate("douyin")}>抖音结构改写</button>
+        </div>
+        <label>BGM 偏好</label>
+        <select value={selectedBgmId} onChange={(event) => setSelectedBgmId(event.target.value)}>
+          <option value="">不指定 BGM</option>
+          {bgmAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
+        </select>
+      </section>
+      <aside className="panel">
+        <h2>文案版本</h2>
+        <div className="script-filter-panel">
+          <input value={scriptQuery} onChange={(event) => setScriptQuery(event.target.value)} placeholder="搜索文案、语义、卖点或画面需求" />
+          <select value={scriptSourceFilter} onChange={(event) => setScriptSourceFilter(event.target.value)}>
+            <option value="">全部来源 {scripts.length}</option>
+            {Object.entries(scriptSourceCounts).map(([source, count]) => <option key={source} value={source}>{source} {count}</option>)}
+          </select>
+        </div>
+        {scriptKeywordSummary.length > 0 && (
+          <div className="tag-line script-summary-tags">
+            {scriptKeywordSummary.map(([tag, count]) => <span className="tag-chip tag-color-default" key={tag}>{tag} {count}</span>)}
+          </div>
+        )}
+        <p className="field-hint">当前显示 {filteredScripts.length} / {scripts.length} 个文案版本。</p>
+        {filteredScripts.map((script) => {
+          const estimatedDuration = script.lines.reduce((sum, line) => sum + Number(line.estimated_duration || 0), 0);
+          const sellingPointTags = Array.from(new Set(script.lines.flatMap((line) => line.selling_points))).slice(0, 6);
+          const visualNeedTags = Array.from(new Set(script.lines.flatMap((line) => line.visual_needs))).slice(0, 6);
+          return (
+          <article className="scheme-card" key={script.id}>
+            {editingScriptId === script.id ? (
+              <ScriptEditor
+                script={scriptDrafts[script.id] ?? script}
+                onCancel={() => setEditingScriptId(null)}
+                onSave={() => saveScriptDraft(script.id)}
+                onTitleChange={(value) => updateScriptDraft(script.id, (draft) => ({ ...draft, title: value }))}
+                onLineChange={(lineIndex, values) => updateScriptLine(script.id, lineIndex, values)}
+                onAddLine={() => addScriptLine(script.id)}
+                onRemoveLine={(lineIndex) => removeScriptLine(script.id, lineIndex)}
+              />
+            ) : (
+              <>
+                <strong>{script.title}</strong>
+                <span>{script.lines.length} 句 · 约 {estimatedDuration.toFixed(1)}s · {script.source_type}</span>
+                {(sellingPointTags.length > 0 || visualNeedTags.length > 0) && (
+                  <div className="tag-line">
+                    {sellingPointTags.map((tag) => <span className="tag-chip tag-color-default" key={`sp-${script.id}-${tag}`}>卖点 · {tag}</span>)}
+                    {visualNeedTags.map((tag) => <span className="tag-chip tag-color-default" key={`vn-${script.id}-${tag}`}>画面 · {tag}</span>)}
+                  </div>
+                )}
+                {script.lines.slice(0, 4).map((line) => <p key={line.line_index}>{line.line_index}. {line.text}</p>)}
+                <button className="ghost-button" onClick={() => startEditScript(script)}>编辑文案</button>
+              </>
+            )}
+            <select value={selectedVoiceByScript[script.id] ?? ""} onChange={(event) => setSelectedVoiceByScript((current) => ({ ...current, [script.id]: event.target.value }))}>
+              <option value="">不指定配音</option>
+              {voiceAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
+            </select>
+            {selectedVoiceByScript[script.id] && <audio src={`${API_BASE_URL}/assets/${selectedVoiceByScript[script.id]}/file`} controls />}
+            <div className="action-row">
+              <button className="secondary" disabled={voiceBusyScriptId === script.id} onClick={() => generateVoiceForScript(script)}>
+                {voiceBusyScriptId === script.id ? "配音中..." : "生成配音"}
+              </button>
+              <button className="secondary" onClick={() => generateTimeline(script)}>按语义填充素材</button>
+            </div>
+          </article>
+        )})}
+        {scripts.length === 0 && <p className="empty">生成后的文案会显示在这里。</p>}
+        {scripts.length > 0 && filteredScripts.length === 0 && <p className="empty">没有匹配当前筛选的文案。</p>}
+      </aside>
+    </section>
+  );
+}
+
+function ScriptEditor(props: {
+  script: ScriptDraft;
+  onTitleChange: (value: string) => void;
+  onLineChange: (lineIndex: number, values: Partial<ScriptLine>) => void;
+  onAddLine: () => void;
+  onRemoveLine: (lineIndex: number) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="script-editor-inline">
+      <label>标题
+        <input value={props.script.title} onChange={(event) => props.onTitleChange(event.target.value)} />
+      </label>
+      {props.script.lines.map((line, index) => (
+        <section className="script-line-editor" key={`${line.line_index}-${index}`}>
+          <div className="timeline-clip-meta">
+            <strong>#{index + 1}</strong>
+            <select value={line.semantic_type} onChange={(event) => props.onLineChange(index, { semantic_type: event.target.value })}>
+              {SEGMENT_TYPES.map((tag) => <option key={tag} value={tag}>{tag}</option>)}
+            </select>
+            <input
+              max={30}
+              min={0.8}
+              step={0.1}
+              type="number"
+              value={line.estimated_duration}
+              onChange={(event) => props.onLineChange(index, { estimated_duration: Number(event.target.value) })}
+            />
+          </div>
+          <textarea rows={3} value={line.text} onChange={(event) => props.onLineChange(index, { text: event.target.value })} />
+          <div className="edit-grid compact">
+            <label>卖点
+              <input value={line.selling_points.join(",")} onChange={(event) => props.onLineChange(index, { selling_points: splitMultiValue(event.target.value) })} />
+            </label>
+            <label>画面需求
+              <input value={line.visual_needs.join(",")} onChange={(event) => props.onLineChange(index, { visual_needs: splitMultiValue(event.target.value) })} />
+            </label>
+          </div>
+          <button className="danger-action" onClick={() => props.onRemoveLine(index)}>删除这一句</button>
+        </section>
+      ))}
+      <div className="action-row">
+        <button className="secondary" onClick={props.onAddLine}>添加一句</button>
+        <button className="ghost-button" onClick={props.onCancel}>取消</button>
+        <button className="primary-action" onClick={props.onSave}>保存文案</button>
+      </div>
+    </div>
+  );
+}
+
+function VoiceWorkspace(props: { project: Project; setError: (value: string) => void; setMessage: (value: string) => void }) {
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [text, setText] = useState("");
+  const [voice, setVoice] = useState("alloy");
+  const [busy, setBusy] = useState(false);
+  const [analyzingAssetId, setAnalyzingAssetId] = useState<number | null>(null);
+  useEffect(() => { void loadAssets(); }, [props.project.id]);
+
+  async function loadAssets() {
+    try {
+      const [voices, bgms] = await Promise.all([
+        api<Asset[]>(`/projects/${props.project.id}/assets?asset_type=voice`),
+        api<Asset[]>(`/projects/${props.project.id}/assets?asset_type=bgm`),
+      ]);
+      setAssets([...voices, ...bgms]);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "声音素材加载失败");
+    }
+  }
+
+  async function generateVoice() {
+    setBusy(true);
+    try {
+      const asset = await api<Asset>("/tts/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: props.project.id, text, voice, title: "AI 口播配音" }),
+      });
+      props.setMessage(`已生成配音素材：${asset.name}`);
+      await loadAssets();
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "配音生成失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function analyzeAudioAsset(asset: Asset) {
+    setAnalyzingAssetId(asset.id);
+    try {
+      const updated = await api<Asset>(`/assets/${asset.id}/analyze-audio`, { method: "POST" });
+      setAssets((items) => items.map((item) => (item.id === updated.id ? updated : item)));
+      const analysis = updated.metadata?.audio_analysis as Record<string, unknown> | undefined;
+      props.setMessage(`已分析响度：${updated.name}${analysis?.input_i ? `，${analysis.input_i} LUFS` : ""}`);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "响度分析失败");
+    } finally {
+      setAnalyzingAssetId(null);
+    }
+  }
+
+  return (
+    <section className="overview-grid">
+      <div className="panel settings-panel">
+        <h2>TTS 配音</h2>
+        <label>音色</label>
+        <input value={voice} onChange={(event) => setVoice(event.target.value)} placeholder="预制音色或供应商音色 ID" />
+        <label>口播文本</label>
+        <textarea rows={10} value={text} onChange={(event) => setText(event.target.value)} />
+        <button className="primary-action" disabled={busy || !text.trim()} onClick={generateVoice}>{busy ? "生成中..." : "生成配音"}</button>
+        <p className="field-hint">未配置 TTS 服务时会生成静音占位音频，用于先跑通“配音驱动时间线”。</p>
+      </div>
+      <div className="panel overview-panel">
+        <h2>声音素材</h2>
+        {assets.map((asset) => {
+          const analysis = asset.metadata?.audio_analysis as Record<string, unknown> | undefined;
+          const loudness = typeof analysis?.input_i === "string" || typeof analysis?.input_i === "number" ? `${analysis.input_i} LUFS` : "";
+          return (
+            <div className="compact-row" key={asset.id}>
+              <span>{asset.name}</span>
+              {(asset.asset_type === "voice" || asset.asset_type === "bgm") ? <audio src={`${API_BASE_URL}/assets/${asset.id}/file`} controls /> : <strong>{asset.asset_type}</strong>}
+              {loudness && <strong>{loudness}</strong>}
+              <button className="ghost-button" disabled={analyzingAssetId === asset.id} onClick={() => analyzeAudioAsset(asset)}>
+                {analyzingAssetId === asset.id ? "分析中..." : "分析响度"}
+              </button>
+            </div>
+          );
+        })}
+        {assets.length === 0 && <p className="empty">在素材库导入 BGM，或在这里生成配音。</p>}
+      </div>
+    </section>
+  );
+}
+
+function SubtitleWorkspace(props: { project: Project; setError: (value: string) => void; setMessage: (value: string) => void }) {
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [selectedAssetId, setSelectedAssetId] = useState<number | null>(null);
+  const [styleDraft, setStyleDraft] = useState<SubtitleStyleDraft>(subtitleStyleFromAsset());
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { void loadAssets(); }, [props.project.id]);
+  const selectedAsset = assets.find((asset) => asset.id === selectedAssetId) ?? assets[0];
+
+  useEffect(() => {
+    if (!selectedAsset) return;
+    setSelectedAssetId(selectedAsset.id);
+    setStyleDraft(subtitleStyleFromAsset(selectedAsset));
+  }, [selectedAsset?.id]);
+
+  async function loadAssets() {
+    try {
+      const nextAssets = await api<Asset[]>(`/projects/${props.project.id}/assets?asset_type=subtitle_preset`);
+      setAssets(nextAssets);
+      if (!selectedAssetId && nextAssets[0]) {
+        setSelectedAssetId(nextAssets[0].id);
+      }
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "字幕预设加载失败");
+    }
+  }
+
+  async function saveSubtitleStyle() {
+    if (!selectedAsset) return;
+    setSaving(true);
+    try {
+      const updated = await api<Asset>(`/assets/${selectedAsset.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ metadata: { ...(selectedAsset.metadata || {}), subtitle_style: styleDraft } }),
+      });
+      setAssets((items) => items.map((item) => (item.id === updated.id ? updated : item)));
+      props.setMessage(`已保存字幕样式：${updated.name}`);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "字幕样式保存失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="overview-grid">
+      <div className="panel overview-panel">
+        <h2>字幕模板</h2>
+        <p className="field-hint">V1 使用 ASS 字幕烧录；导入的 .ass/.json 可直接作为模板，也可以在这里覆盖常用样式参数。</p>
+        {assets.map((asset) => (
+          <button className={`timeline-row-button ${selectedAsset?.id === asset.id ? "active" : ""}`} key={asset.id} onClick={() => setSelectedAssetId(asset.id)}>
+            <span>{asset.name}</span>
+            <strong>{asset.status}</strong>
+          </button>
+        ))}
+        {assets.length === 0 && <p className="empty">可以在素材库选择“字幕预设”导入 .ass/.json/.txt。</p>}
+      </div>
+      <div className="panel settings-panel">
+        <h2>样式编辑</h2>
+        {selectedAsset ? (
+          <>
+            <label>字体
+              <input value={styleDraft.font} onChange={(event) => setStyleDraft({ ...styleDraft, font: event.target.value })} />
+            </label>
+            <label>字号
+              <input min={20} max={120} type="number" value={styleDraft.size} onChange={(event) => setStyleDraft({ ...styleDraft, size: Number(event.target.value) })} />
+            </label>
+            <label>主色 ASS
+              <input value={styleDraft.primary_color} onChange={(event) => setStyleDraft({ ...styleDraft, primary_color: event.target.value })} />
+            </label>
+            <label>描边色 ASS
+              <input value={styleDraft.outline_color} onChange={(event) => setStyleDraft({ ...styleDraft, outline_color: event.target.value })} />
+            </label>
+            <label>背景色 ASS
+              <input value={styleDraft.back_color} onChange={(event) => setStyleDraft({ ...styleDraft, back_color: event.target.value })} />
+            </label>
+            <label className="checkbox-line">
+              <input checked={styleDraft.bold} type="checkbox" onChange={(event) => setStyleDraft({ ...styleDraft, bold: event.target.checked })} />
+              加粗
+            </label>
+            <label>描边
+              <input min={0} max={12} step={0.5} type="number" value={styleDraft.outline} onChange={(event) => setStyleDraft({ ...styleDraft, outline: Number(event.target.value) })} />
+            </label>
+            <label>阴影
+              <input min={0} max={8} step={0.5} type="number" value={styleDraft.shadow} onChange={(event) => setStyleDraft({ ...styleDraft, shadow: Number(event.target.value) })} />
+            </label>
+            <label>位置
+              <select value={styleDraft.alignment} onChange={(event) => setStyleDraft({ ...styleDraft, alignment: Number(event.target.value) })}>
+                <option value={2}>底部居中</option>
+                <option value={5}>画面居中</option>
+                <option value={8}>顶部居中</option>
+              </select>
+            </label>
+            <label>底部边距
+              <input min={20} max={500} step={10} type="number" value={styleDraft.margin_v} onChange={(event) => setStyleDraft({ ...styleDraft, margin_v: Number(event.target.value) })} />
+            </label>
+            <button className="primary-action" disabled={saving} onClick={saveSubtitleStyle}>{saving ? "保存中..." : "保存字幕样式"}</button>
+          </>
+        ) : (
+          <p className="empty">导入字幕预设后，可在这里调整字体、描边、阴影和位置。</p>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -905,7 +1838,7 @@ function useCloseTagMenusOnOutsideClick() {
 }
 
 function splitMultiValue(value: string | undefined) {
-  return (value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  return (value ?? "").split(/[,，、\n]/).map((item) => item.trim()).filter(Boolean);
 }
 
 function joinMultiValue(values: string[]) {
@@ -922,6 +1855,33 @@ function multiValuesOverlap(value: string, expected: string) {
   return expectedValues.some((item) => multiValueIncludes(value, item));
 }
 
+function assetInputLoudness(asset?: Asset) {
+  const analysis = asset?.metadata?.audio_analysis as Record<string, unknown> | undefined;
+  const value = analysis?.input_i;
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function subtitleStyleFromAsset(asset?: Asset): SubtitleStyleDraft {
+  const style = asset?.metadata?.subtitle_style as Partial<SubtitleStyleDraft> | undefined;
+  return {
+    font: String(style?.font || "Arial"),
+    size: Number(style?.size || 64),
+    primary_color: String(style?.primary_color || "&H00FFFFFF"),
+    outline_color: String(style?.outline_color || "&H00111111"),
+    back_color: String(style?.back_color || "&H66000000"),
+    bold: style?.bold !== false,
+    outline: Number(style?.outline ?? 4),
+    shadow: Number(style?.shadow ?? 1),
+    alignment: Number(style?.alignment || 2),
+    margin_v: Number(style?.margin_v || 150),
+  };
+}
+
 function tagColorClass(tag: string) {
   const index = SEGMENT_TYPES.indexOf(tag);
   return index >= 0 ? `tag-color-${index}` : "tag-color-default";
@@ -929,6 +1889,56 @@ function tagColorClass(tag: string) {
 
 function TagChip(props: { tag: string; className?: string }) {
   return <span className={`tag-chip ${tagColorClass(props.tag)} ${props.className ?? ""}`.trim()}>{props.tag}</span>;
+}
+
+function TagInputChips(props: { value: string; onChange: (value: string) => void; placeholder?: string }) {
+  const [draft, setDraft] = useState("");
+  const tags = splitMultiValue(props.value);
+
+  function commit(input = draft) {
+    const nextTags = splitMultiValue(input);
+    if (nextTags.length === 0) return;
+    props.onChange(joinMultiValue(Array.from(new Set([...tags, ...nextTags]))));
+    setDraft("");
+  }
+
+  function removeTag(tag: string) {
+    props.onChange(joinMultiValue(tags.filter((item) => item !== tag)));
+  }
+
+  return (
+    <div className="tag-input-box">
+      <div className="tag-input-row">
+        <input
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              commit();
+            }
+          }}
+          onPaste={(event) => {
+            const text = event.clipboardData.getData("text");
+            if (/[,，、\n]/.test(text)) {
+              event.preventDefault();
+              commit(text);
+            }
+          }}
+          placeholder={props.placeholder ?? "输入 tag 后回车"}
+        />
+        <button className="secondary" disabled={!draft.trim()} onClick={() => commit()}>录入</button>
+      </div>
+      <div className="tag-input-chips">
+        {tags.map((tag) => (
+          <button className="tag-chip tag-color-default tag-remove-chip" key={tag} onClick={() => removeTag(tag)} title="点击删除">
+            {tag} ×
+          </button>
+        ))}
+        {tags.length === 0 && <span className="tag-input-empty">还没有录入 tag</span>}
+      </div>
+    </div>
+  );
 }
 
 function parseTranscriptSegments(value: string | undefined): TranscriptSegment[] {
@@ -968,6 +1978,16 @@ function MaterialMixWorkspace(props: {
   const [showSegmentPicker, setShowSegmentPicker] = useState(false);
   const [query, setQuery] = useState("");
   const [outputDir, setOutputDir] = useState("");
+  const [voiceAssets, setVoiceAssets] = useState<Asset[]>([]);
+  const [bgmAssets, setBgmAssets] = useState<Asset[]>([]);
+  const [subtitleAssets, setSubtitleAssets] = useState<Asset[]>([]);
+  const [audioPolicy, setAudioPolicy] = useState("keep_original");
+  const [voiceAssetId, setVoiceAssetId] = useState("");
+  const [bgmAssetId, setBgmAssetId] = useState("");
+  const [normalizeLoudness, setNormalizeLoudness] = useState(true);
+  const [targetLufs, setTargetLufs] = useState(-14);
+  const [burnSubtitles, setBurnSubtitles] = useState(false);
+  const [subtitlePresetId, setSubtitlePresetId] = useState("");
   const [previewVersion, setPreviewVersion] = useState(0);
   const [clipPreviewVersion, setClipPreviewVersion] = useState(0);
   const [selectedClipId, setSelectedClipId] = useState<number | null>(null);
@@ -985,6 +2005,23 @@ function MaterialMixWorkspace(props: {
   ));
   const clips = selectedTimeline?.clips ?? [];
   const selectedClip = clips.find((clip) => clip.clip_id === selectedClipId) ?? null;
+  const selectedVoiceAsset = voiceAssets.find((asset) => String(asset.id) === voiceAssetId);
+  const selectedBgmAsset = bgmAssets.find((asset) => String(asset.id) === bgmAssetId);
+  const selectedVoiceLoudness = assetInputLoudness(selectedVoiceAsset);
+  const selectedBgmLoudness = assetInputLoudness(selectedBgmAsset);
+  const exportAudioHints = [
+    selectedVoiceAsset && selectedVoiceLoudness === null ? "配音素材还没有响度分析，建议先到“配音/BGM”页面分析后再导出。" : "",
+    selectedBgmAsset && selectedBgmLoudness === null ? "BGM 还没有响度分析，建议先到“配音/BGM”页面分析后再混音。" : "",
+    selectedBgmLoudness !== null && selectedBgmLoudness > -12 ? "当前 BGM 响度偏高，导出会做统一响度，但建议试听确认口播不会被盖住。" : "",
+    selectedVoiceLoudness !== null && selectedVoiceLoudness < -24 ? "当前配音响度偏低，建议重新生成或导出时保持统一响度开启。" : "",
+  ].filter(Boolean);
+  const audioMixRecommendation = selectedVoiceAsset
+    ? selectedBgmAsset
+      ? "推荐：配音替换原音频 + BGM 混音 + 统一响度 -14 LUFS。"
+      : "推荐：配音替换原音频 + 统一响度 -14 LUFS。"
+    : selectedBgmAsset
+      ? "推荐：保留原音频 + BGM 混音 + 统一响度 -14 LUFS。"
+      : "推荐：保留原音频；如原素材音量不稳，开启统一响度。";
   const previewSource = selectedTimelineId && clips.length > 0
     ? `${API_BASE_URL}/material-mix/timelines/${selectedTimelineId}/preview?v=${previewVersion}`
     : "";
@@ -994,7 +2031,19 @@ function MaterialMixWorkspace(props: {
 
   useEffect(() => {
     void loadTimelines();
+    void loadExportAssets();
   }, [props.project.id]);
+
+  useEffect(() => {
+    if (!selectedTimeline) return;
+    setAudioPolicy(selectedTimeline.audio_policy || "keep_original");
+    setVoiceAssetId(selectedTimeline.voice_asset_id ? String(selectedTimeline.voice_asset_id) : "");
+    setBgmAssetId(selectedTimeline.bgm_asset_id ? String(selectedTimeline.bgm_asset_id) : "");
+    setSubtitlePresetId(selectedTimeline.subtitle_preset_id ? String(selectedTimeline.subtitle_preset_id) : "");
+    setNormalizeLoudness(Boolean(selectedTimeline.normalize_loudness));
+    setTargetLufs(Number(selectedTimeline.target_lufs ?? -14));
+    setBurnSubtitles(Boolean(selectedTimeline.burn_subtitles));
+  }, [selectedTimeline?.id]);
 
   useEffect(() => {
     if (!selectedTimelineId) {
@@ -1045,6 +2094,21 @@ function MaterialMixWorkspace(props: {
     }
   }
 
+  async function loadExportAssets() {
+    try {
+      const [voices, bgms, subtitles] = await Promise.all([
+        api<Asset[]>(`/projects/${props.project.id}/assets?asset_type=voice`),
+        api<Asset[]>(`/projects/${props.project.id}/assets?asset_type=bgm`),
+        api<Asset[]>(`/projects/${props.project.id}/assets?asset_type=subtitle_preset`),
+      ]);
+      setVoiceAssets(voices);
+      setBgmAssets(bgms);
+      setSubtitleAssets(subtitles);
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "导出素材加载失败");
+    }
+  }
+
   async function patchTimeline(timelineId: number, body: Partial<Pick<MaterialMixTimeline, "name" | "is_favorite">>) {
     try {
       const timeline = await api<MaterialMixTimeline>(`/material-mix/timelines/${timelineId}`, {
@@ -1078,7 +2142,7 @@ function MaterialMixWorkspace(props: {
 
   async function deleteTimeline(timelineId: number) {
     const timeline = timelines.find((item) => item.id === timelineId);
-    if (!window.confirm(`确定删除素材混剪草稿「${timeline?.name ?? timelineId}」吗？这只会删除草稿和时间线片段，不会删除片段库素材。`)) {
+    if (!window.confirm(`确定删除素材混剪草稿「${timeline?.name ?? timelineId}」吗？这只会删除草稿和时间线片段，不会删除素材库内容。`)) {
       return;
     }
     try {
@@ -1105,7 +2169,9 @@ function MaterialMixWorkspace(props: {
 
   async function loadTimeline(timelineId: number) {
     try {
-      setSelectedTimeline(await api<MaterialMixTimeline>(`/material-mix/timelines/${timelineId}`));
+      const timeline = await api<MaterialMixTimeline>(`/material-mix/timelines/${timelineId}`);
+      setSelectedTimeline(timeline);
+      setGenerationNotes(Object.fromEntries((timeline.clips ?? []).map((clip) => [clip.clip_id, clip.selection_note || "手动加入或历史片段"])));
       setPreviewVersion((current) => current + 1);
     } catch (err) {
       props.setError(err instanceof Error ? err.message : "素材混剪详情加载失败");
@@ -1128,7 +2194,7 @@ function MaterialMixWorkspace(props: {
 
   async function generateTimeline() {
     if (props.segments.length === 0) {
-      props.setError("当前项目还没有可用语义片段，请先完成导入分析或片段库切片。");
+      props.setError("当前项目还没有可用语义片段，请先完成导入分析或在素材库里完成切片。");
       return;
     }
     setGenerating(true);
@@ -1170,7 +2236,7 @@ function MaterialMixWorkspace(props: {
       const timeline = await api<MaterialMixTimeline>(`/material-mix/timelines/${selectedTimelineId}/clips`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ segment_id: segmentId }),
+        body: JSON.stringify({ segment_id: segmentId, selection_note: "用户手动加入时间线" }),
       });
       setSelectedTimeline(timeline);
       setSelectedClipId(timeline.clips?.at(-1)?.clip_id ?? null);
@@ -1231,7 +2297,16 @@ function MaterialMixWorkspace(props: {
       const result = await api<{ export_path: string }>(`/material-mix/timelines/${selectedTimelineId}/export`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ output_dir: outputDir || undefined }),
+        body: JSON.stringify({
+          output_dir: outputDir || undefined,
+          audio_policy: audioPolicy,
+          voice_asset_id: voiceAssetId ? Number(voiceAssetId) : undefined,
+          bgm_asset_id: bgmAssetId ? Number(bgmAssetId) : undefined,
+          subtitle_preset_id: subtitlePresetId ? Number(subtitlePresetId) : undefined,
+          normalize_loudness: normalizeLoudness,
+          target_lufs: targetLufs,
+          burn_subtitles: burnSubtitles,
+        }),
       });
       props.setMessage(`素材混剪已导出：${result.export_path}`);
     } catch (err) {
@@ -1239,6 +2314,27 @@ function MaterialMixWorkspace(props: {
     } finally {
       setExporting(false);
     }
+  }
+
+  function applyAudioMixRecommendation() {
+    if (selectedVoiceAsset) {
+      setAudioPolicy(selectedBgmAsset ? "replace_with_voice" : "replace_with_voice");
+      setNormalizeLoudness(true);
+      setTargetLufs(-14);
+      props.setMessage("已应用推荐音频策略：配音优先，并开启统一响度。");
+      return;
+    }
+    if (selectedBgmAsset) {
+      setAudioPolicy("keep_original");
+      setNormalizeLoudness(true);
+      setTargetLufs(-14);
+      props.setMessage("已应用推荐音频策略：保留原音频、叠加 BGM，并统一响度。");
+      return;
+    }
+    setAudioPolicy("keep_original");
+    setNormalizeLoudness(true);
+    setTargetLufs(-14);
+    props.setMessage("已应用推荐音频策略：保留原音频，并开启统一响度。");
   }
 
   async function chooseOutputDir() {
@@ -1285,20 +2381,22 @@ function MaterialMixWorkspace(props: {
     }
   }
 
-  async function replaceClip(clip: MaterialMixClip, segment: Segment) {
+  async function replaceClip(clip: MaterialMixClip, segment: Segment, selectionReason = "") {
     if (!selectedTimelineId) return;
+    const note = `手动替换为「${splitMultiValue(segment.semantic_type)[0] || segment.semantic_type || "未标注"}」片段`
+      + (selectionReason ? `，${selectionReason}` : segment.selling_points ? `，卖点：${splitMultiValue(segment.selling_points).slice(0, 3).join(" / ")}` : "");
     try {
       const timeline = await api<MaterialMixTimeline>(`/material-mix/timelines/${selectedTimelineId}/clips/${clip.clip_id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ segment_id: segment.id }),
+        body: JSON.stringify({ segment_id: segment.id, selection_note: note }),
       });
       setSelectedTimeline(timeline);
       setSelectedClipId(clip.clip_id);
       setReplacementClipId(null);
       setGenerationNotes((current) => ({
         ...current,
-        [clip.clip_id]: `手动替换为「${splitMultiValue(segment.semantic_type)[0] || segment.semantic_type || "未标注"}」片段`,
+        [clip.clip_id]: note,
       }));
       setClipPreviewMode(null);
       setPreviewVersion((current) => current + 1);
@@ -1324,10 +2422,23 @@ function MaterialMixWorkspace(props: {
       .map((segment) => {
         const sameSemantic = multiValuesOverlap(segment.semantic_type, clip.semantic_type);
         const samePosition = multiValuesOverlap(segment.position_type, clip.position_type);
+        const sameSellingPoint = multiValuesOverlap(segment.selling_points ?? "", clip.selling_points ?? "");
+        const sameVisualTag = multiValuesOverlap(segment.visual_tags ?? "", clip.visual_tags ?? "");
         const unused = !usedSegmentIds.has(segment.id);
         const distinctSource = segment.video_name !== clip.video_name;
-        const score = (sameSemantic ? 100 : 0) + (samePosition ? 30 : 0) + (distinctSource ? 12 : 0) + (unused ? 8 : 0);
-        return { segment, score, sameSemantic, samePosition };
+        const durationGap = Math.abs((segment.end_seconds - segment.start_seconds) - (clip.timeline_out - clip.timeline_in));
+        const durationFit = durationGap < 1.2;
+        const score = (sameSemantic ? 100 : 0) + (samePosition ? 30 : 0) + (sameSellingPoint ? 26 : 0) + (sameVisualTag ? 18 : 0) + (distinctSource ? 12 : 0) + (unused ? 8 : 0) + (durationFit ? 6 : 0);
+        const reasons = [
+          sameSemantic ? "同语义" : "",
+          samePosition ? "同位置" : "",
+          sameSellingPoint ? "卖点命中" : "",
+          sameVisualTag ? "画面命中" : "",
+          distinctSource ? "来源分散" : "",
+          unused ? "未使用" : "",
+          durationFit ? "时长接近" : "",
+        ].filter(Boolean);
+        return { segment, score, sameSemantic, samePosition, sameSellingPoint, sameVisualTag, reasons };
       })
       .sort((left, right) => right.score - left.score || left.segment.video_name.localeCompare(right.segment.video_name) || left.segment.start_seconds - right.segment.start_seconds);
     return scored;
@@ -1427,9 +2538,60 @@ function MaterialMixWorkspace(props: {
             {exporting ? "导出中..." : "导出"}
           </button>
         </div>
+        <div className="material-toolbar-grid export-options-grid">
+          <div className="audio-recommendation">
+            <span>{audioMixRecommendation}</span>
+            <button className="ghost-button" onClick={applyAudioMixRecommendation}>应用推荐</button>
+          </div>
+          <label>原音频策略
+            <select value={audioPolicy} onChange={(event) => setAudioPolicy(event.target.value)}>
+              <option value="keep_original">保留原音频</option>
+              <option value="remove_original">移除原音频</option>
+              <option value="enhance_voice">保留人声增强轨</option>
+              <option value="replace_with_voice">替换为配音</option>
+              <option value="voice_over">原音频叠加配音</option>
+            </select>
+          </label>
+          <label>配音素材
+            <select value={voiceAssetId} onChange={(event) => setVoiceAssetId(event.target.value)}>
+              <option value="">不使用配音</option>
+              {voiceAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
+            </select>
+            {selectedVoiceLoudness !== null && <span className="field-hint">已分析：{selectedVoiceLoudness.toFixed(1)} LUFS</span>}
+          </label>
+          <label>BGM
+            <select value={bgmAssetId} onChange={(event) => setBgmAssetId(event.target.value)}>
+              <option value="">不加 BGM</option>
+              {bgmAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
+            </select>
+            {selectedBgmLoudness !== null && <span className="field-hint">已分析：{selectedBgmLoudness.toFixed(1)} LUFS</span>}
+          </label>
+          <label className="checkbox-line compact-check">
+            <input checked={normalizeLoudness} onChange={(event) => setNormalizeLoudness(event.target.checked)} type="checkbox" />
+            统一响度
+          </label>
+          <label>目标 LUFS
+            <input max={-8} min={-24} step={1} type="number" value={targetLufs} onChange={(event) => setTargetLufs(Number(event.target.value))} />
+          </label>
+          <label className="checkbox-line compact-check">
+            <input checked={burnSubtitles} onChange={(event) => setBurnSubtitles(event.target.checked)} type="checkbox" />
+            一键字幕
+          </label>
+          <label>字幕预设
+            <select value={subtitlePresetId} onChange={(event) => setSubtitlePresetId(event.target.value)}>
+              <option value="">内置字幕</option>
+              {subtitleAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
+            </select>
+          </label>
+        </div>
         {generationWarnings.length > 0 && (
           <div className="material-warning-list">
             {generationWarnings.map((warning) => <span key={warning}>{warning}</span>)}
+          </div>
+        )}
+        {exportAudioHints.length > 0 && (
+          <div className="material-warning-list">
+            {exportAudioHints.map((hint) => <span key={hint}>{hint}</span>)}
           </div>
         )}
         <p className="material-output-dir">{outputDir || "未选择时默认保存到 data/exports"}</p>
@@ -1506,7 +2668,7 @@ function MaterialMixWorkspace(props: {
                     <small>{clip.video_name} · 源 {formatClockPrecise(clip.source_in)} - {formatClockPrecise(clip.source_out)}</small>
                     <p className="clip-selection-note">
                       <strong>理由</strong>
-                      <span>{generationNotes[clip.clip_id] || "手动加入或历史片段"}</span>
+                      <span>{clip.selection_note || generationNotes[clip.clip_id] || "手动加入或历史片段"}</span>
                     </p>
                     {replacementClipId === clip.clip_id && (
                       <section className="replacement-panel material-replacement-panel" onClick={(event) => event.stopPropagation()}>
@@ -1518,11 +2680,20 @@ function MaterialMixWorkspace(props: {
                           <button className="secondary" onClick={() => setReplacementClipId(null)}>收起</button>
                         </div>
                         <div className="replacement-list">
-                          {replacementCandidates.map(({ segment, sameSemantic, samePosition }) => (
-                            <button className="replacement-card" key={segment.id} onClick={() => replaceClip(clip, segment)}>
+                          {replacementCandidates.map(({ segment, sameSemantic, samePosition, score, reasons }) => (
+                            <button className="replacement-card" key={segment.id} onClick={() => replaceClip(clip, segment, reasons.slice(0, 4).join(" / "))}>
                               <img src={`${API_BASE_URL}/segments/${segment.id}/thumbnail`} />
                               <span>{sameSemantic ? "同内容" : "其他内容"} · {samePosition ? "同位置" : "其他位置"} · {(segment.end_seconds - segment.start_seconds).toFixed(1)}s</span>
+                              <div className="candidate-score-line">
+                                <strong>{score}</strong>
+                                <small>{reasons.slice(0, 4).join(" / ") || "补充候选"}</small>
+                              </div>
                               <div className="segment-type-line">{splitMultiValue(segment.semantic_type).map((tag) => <TagChip key={tag} tag={tag} />)}</div>
+                              {(segment.selling_points || segment.visual_tags) && (
+                                <div className="segment-type-line">
+                                  {[...splitMultiValue(segment.selling_points), ...splitMultiValue(segment.visual_tags)].slice(0, 4).map((tag) => <span className="tag-chip tag-color-default" key={tag}>{tag}</span>)}
+                                </div>
+                              )}
                               <strong>{segment.text.slice(0, 52) || `片段 #${segment.id}`}</strong>
                               <small>{segment.video_name}</small>
                             </button>
@@ -1652,6 +2823,7 @@ function MaterialMixWorkspace(props: {
 
 function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRefresh: () => void; setError: (value: string) => void; setMessage: (value: string) => void }) {
   useCloseTagMenusOnOutsideClick();
+  const [libraryGroup, setLibraryGroup] = useState<"finished" | "loose">("finished");
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const [position, setPosition] = useState("");
   const [query, setQuery] = useState("");
@@ -1668,23 +2840,45 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
   const previewRef = useRef<HTMLVideoElement | null>(null);
   const selectedPreviewAutoplayRef = useRef(false);
   useVideoKeyboardShortcuts(previewRef, !splitTarget);
-  const filtered = props.segments
+  const groupSegments = props.segments.filter((segment) => (
+    libraryGroup === "loose"
+      ? String(segment.source_mode || "") === "product_assets"
+      : String(segment.source_mode || "") !== "product_assets"
+  ));
+  const finishedCount = props.segments.filter((segment) => String(segment.source_mode || "") !== "product_assets").length;
+  const looseCount = props.segments.filter((segment) => String(segment.source_mode || "") === "product_assets").length;
+  const filtered = groupSegments
     .filter((segment) => (tagFilters.length === 0 || tagFilters.some((tag) => multiValueIncludes(segment.semantic_type, tag))) && (!position || multiValueIncludes(segment.position_type, position)))
-    .filter((segment) => !query.trim() || `${segment.text} ${segment.video_name} ${segment.semantic_type}`.toLowerCase().includes(query.trim().toLowerCase()))
+    .filter((segment) => !query.trim() || `${segment.text} ${segment.video_name} ${segment.semantic_type} ${segment.selling_points ?? ""} ${segment.visual_tags ?? ""} ${segment.visual_description ?? ""}`.toLowerCase().includes(query.trim().toLowerCase()))
     .sort((a, b) => {
       if (sortMode === "duration") return (b.end_seconds - b.start_seconds) - (a.end_seconds - a.start_seconds);
       return a.video_name.localeCompare(b.video_name) || a.start_seconds - b.start_seconds;
     });
-  const selected = props.segments.find((segment) => segment.id === selectedId) ?? filtered[0] ?? null;
+  const selected = groupSegments.find((segment) => segment.id === selectedId) ?? filtered[0] ?? null;
   const tagCounts = SEGMENT_TYPES.map((tag) => ({
     tag,
-    count: props.segments.filter((segment) => multiValueIncludes(segment.semantic_type, tag)).length,
+    count: groupSegments.filter((segment) => multiValueIncludes(segment.semantic_type, tag)).length,
   }));
+  const exportTagGroups = Array.from(groupSegments.reduce<Map<string, { tag: string; kind: string; segments: Segment[] }>>((groups, segment) => {
+    [
+      ...splitMultiValue(segment.semantic_type).map((tag) => ({ tag, kind: "语义" })),
+      ...splitMultiValue(segment.selling_points).map((tag) => ({ tag, kind: "卖点" })),
+      ...splitMultiValue(segment.visual_tags).map((tag) => ({ tag, kind: "画面" })),
+    ].forEach(({ tag, kind }) => {
+      const key = `${kind}:${tag}`;
+      const group = groups.get(key) ?? { tag, kind, segments: [] };
+      group.segments.push(segment);
+      groups.set(key, group);
+    });
+    return groups;
+  }, new Map()).values()).sort((left, right) => right.segments.length - left.segments.length || left.tag.localeCompare(right.tag)).slice(0, 18);
   const groupedSegments = filtered.reduce<Record<string, Segment[]>>((groups, segment) => {
     groups[segment.video_name] = groups[segment.video_name] ?? [];
     groups[segment.video_name].push(segment);
     return groups;
   }, {});
+  const selectedVideo = selected ? props.videos.find((video) => video.id === selected.video_id) : null;
+  const previewOrientation = selectedVideo && selectedVideo.height > selectedVideo.width ? "portrait" : "landscape";
 
   useEffect(() => {
     if (!selected) {
@@ -1774,7 +2968,8 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
       position_type: draft.position_type,
       start_seconds: Number(draft.start_seconds ?? selected.start_seconds),
       end_seconds: Number(draft.end_seconds ?? selected.end_seconds),
-      text: draft.text ?? selected.text,
+      selling_points: draft.selling_points ?? selected.selling_points ?? "",
+      visual_tags: draft.visual_tags ?? selected.visual_tags ?? "",
     });
   }
 
@@ -1810,7 +3005,7 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
     ));
   }
 
-  async function exportSegmentIds(segmentIds: number[]) {
+  async function exportSegmentIds(segmentIds: number[], exportTag = "") {
     if (segmentIds.length === 0) {
       props.setError("请先选择要导出的片段。");
       return;
@@ -1819,9 +3014,9 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
       const result = await api<{ export_paths: string[]; export_root?: string }>("/segments/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ segment_ids: segmentIds, output_dir: exportDir || undefined }),
+        body: JSON.stringify({ segment_ids: segmentIds, output_dir: exportDir || undefined, export_tag: exportTag }),
       });
-      props.setMessage(`已导出 ${result.export_paths.length} 个素材，已按语义 tag 放入项目文件夹：${result.export_root || result.export_paths.join("；")}`);
+      props.setMessage(`已导出 ${result.export_paths.length} 个素材，已放入${exportTag ? `「${exportTag}」` : "语义 tag"}文件夹：${result.export_root || result.export_paths.join("；")}`);
     } catch (err) {
       props.setError(err instanceof Error ? err.message : "导出失败");
     }
@@ -1911,6 +3106,34 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
   return (
     <>
       <div className="view-sticky-head segment-sticky-head">
+        <div className="section-title segment-manager-title">
+          <div>
+            <h2>素材片段管理</h2>
+            <p>筛选、导出、微调、拆分。</p>
+          </div>
+        </div>
+        <section className="segment-source-switch">
+          <button
+            className={libraryGroup === "finished" ? "active" : ""}
+            onClick={() => {
+              setLibraryGroup("finished");
+              setSelectedId(null);
+              setSelectedForExport([]);
+            }}
+          >
+            成片导入分析片段 <strong>{finishedCount}</strong>
+          </button>
+          <button
+            className={libraryGroup === "loose" ? "active" : ""}
+            onClick={() => {
+              setLibraryGroup("loose");
+              setSelectedId(null);
+              setSelectedForExport([]);
+            }}
+          >
+            用户导入零散素材 <strong>{looseCount}</strong>
+          </button>
+        </section>
         <section className="segment-toolbar">
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索台词或关键词..." />
           <div className="segmented-control" aria-label="视图">
@@ -1931,7 +3154,7 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
 
         <section className="tag-filter-strip">
           <button className={tagFilters.length === 0 ? "tag-filter active" : "tag-filter"} onClick={() => setTagFilters([])}>
-            全部 {props.segments.length}
+            全部 {groupSegments.length}
           </button>
           {tagCounts.map(({ tag, count }) => (
             <button
@@ -1945,10 +3168,25 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
           ))}
         </section>
 
+        {exportTagGroups.length > 0 && (
+          <section className="tag-export-strip">
+            <span>按 tag 导出</span>
+            {exportTagGroups.map((group) => (
+              <button
+                className="tag-filter"
+                key={`${group.kind}:${group.tag}`}
+                onClick={() => exportSegmentIds(group.segments.map((segment) => segment.id), group.tag)}
+              >
+                {group.kind} · {group.tag} {group.segments.length}
+              </button>
+            ))}
+          </section>
+        )}
+
         <section className="export-bar">
           <button className="secondary" onClick={chooseExportDir}>选择保存路径</button>
           <span>{exportDir || "未选择时默认保存到 data/exports"}</span>
-          <button className="secondary" disabled={deduping || props.segments.length === 0} onClick={dedupeSegments}>
+          <button className="secondary" disabled={deduping || groupSegments.length === 0} onClick={dedupeSegments}>
             {deduping ? "检测中..." : "剔除重复片段"}
           </button>
           <button className="danger-action" disabled={selectedForExport.length === 0} onClick={deleteSelectedSegments}>
@@ -1965,7 +3203,7 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
 
       <section className="segment-workbench">
         <div className="segment-browser">
-          <p className="segment-count">{filtered.length} / {props.segments.length} 个分镜</p>
+          <p className="segment-count">{filtered.length} / {groupSegments.length} 个分镜</p>
           {Object.entries(groupedSegments).map(([videoName, videoSegments]) => (
             <section className="video-segment-group" key={videoName}>
               <div className="video-group-title">
@@ -1984,6 +3222,7 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
                     onSelect={() => selectSegmentForPreview(segment)}
                     onNudge={nudgeSegment}
                     onTagsChange={(targetSegment, field, values) => patchSegment(targetSegment, { [field]: joinMultiValue(values) })}
+                    onTextChange={(targetSegment, text) => patchSegment(targetSegment, { text })}
                     onToggleExport={() => toggleExportSelection(segment.id)}
                     onSplit={() => {
                       setSelectedId(segment.id);
@@ -1994,68 +3233,85 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
               </div>
             </section>
           ))}
-          {filtered.length === 0 && <p className="empty panel">暂无片段。</p>}
+          {filtered.length === 0 && (
+            <p className="empty panel">
+              {groupSegments.length === 0
+                ? (libraryGroup === "finished" ? "暂无成片导入分析片段。" : "暂无用户导入的零散素材。")
+                : "没有匹配搜索条件的片段。"}
+            </p>
+          )}
         </div>
 
         <aside className="panel segment-editor">
           {selected ? (
             <>
-              <div className="section-title">
-                <div>
-                  <h2>片段微调</h2>
-                  <p>{selected.video_name}</p>
+              <div className="segment-preview-sticky">
+                <div className="section-title">
+                  <div>
+                    <h2>片段微调</h2>
+                    <p>{selected.video_name}</p>
+                  </div>
+                  <button className="primary-action" onClick={saveSegment}>保存</button>
                 </div>
-                <button className="primary-action" onClick={saveSegment}>保存</button>
+                <div className={`large-preview-shell ${previewOrientation}`}>
+                  <video
+                    key={`${selected.id}-${previewVersion}`}
+                    ref={previewRef}
+                    src={`${API_BASE_URL}/segments/${selected.id}/preview?v=${previewVersion}`}
+                    controls
+                    tabIndex={0}
+                    onClick={(event) => event.currentTarget.focus()}
+                    onKeyDown={handleVideoShortcut}
+                    onLoadedMetadata={handlePreviewLoaded}
+                    onPlay={(event) => {
+                      if (isPreviewAtEnd(event.currentTarget)) {
+                        event.currentTarget.currentTime = 0;
+                      }
+                    }}
+                    onTimeUpdate={handlePreviewTimeUpdate}
+                  />
+                </div>
               </div>
-              <div className="large-preview-shell">
-                <video
-                  key={`${selected.id}-${previewVersion}`}
-                  ref={previewRef}
-                  src={`${API_BASE_URL}/segments/${selected.id}/preview?v=${previewVersion}`}
-                  controls
-                  tabIndex={0}
-                  onClick={(event) => event.currentTarget.focus()}
-                  onKeyDown={handleVideoShortcut}
-                  onLoadedMetadata={handlePreviewLoaded}
-                  onPlay={(event) => {
-                    if (isPreviewAtEnd(event.currentTarget)) {
-                      event.currentTarget.currentTime = 0;
-                    }
-                  }}
-                  onTimeUpdate={handlePreviewTimeUpdate}
-                />
+              <div className="clip-time-label">{formatClockPrecise(selected.start_seconds)} - {formatClockPrecise(selected.end_seconds)}</div>
+              <div className="trim-inline-row">
+                <label>
+                  <span>入点</span>
+                  <input type="number" step="0.1" value={draft.start_seconds ?? selected.start_seconds} onChange={(event) => setDraft((current) => ({ ...current, start_seconds: Number(event.target.value) }))} />
+                </label>
+                <div className="micro-controls">
+                  <button onClick={() => nudgeSegment(selected, "start", -0.1)}>入-</button>
+                  <button onClick={() => nudgeSegment(selected, "start", 0.1)}>入+</button>
+                  <button onClick={() => nudgeSegment(selected, "end", -0.1)}>出-</button>
+                  <button onClick={() => nudgeSegment(selected, "end", 0.1)}>出+</button>
+                </div>
+                <label>
+                  <input type="number" step="0.1" value={draft.end_seconds ?? selected.end_seconds} onChange={(event) => setDraft((current) => ({ ...current, end_seconds: Number(event.target.value) }))} />
+                  <span>出点</span>
+                </label>
               </div>
-              <div className="micro-controls">
-                <button onClick={() => nudgeSegment(selected, "start", -0.1)}>入-</button>
-                <button onClick={() => nudgeSegment(selected, "start", 0.1)}>入+</button>
-                <button onClick={() => nudgeSegment(selected, "end", -0.1)}>出-</button>
-                <button onClick={() => nudgeSegment(selected, "end", 0.1)}>出+</button>
-              </div>
-              <div className="edit-grid compact">
-                <MultiValueEditor
-                  label="Tag"
+              <div className="tag-line editor-tag-pills">
+                <CardTagPicker
+                  label="语义"
                   options={SEGMENT_TYPES}
                   values={splitMultiValue(draft.semantic_type ?? selected.semantic_type)}
                   onChange={(values) => setDraft((current) => ({ ...current, semantic_type: joinMultiValue(values) }))}
                 />
-                <MultiValueEditor
+                <CardTagPicker
                   label="位置"
                   options={POSITION_TYPES}
                   values={splitMultiValue(draft.position_type ?? selected.position_type)}
                   onChange={(values) => setDraft((current) => ({ ...current, position_type: joinMultiValue(values) }))}
                 />
-                <label>开始秒
-                  <input type="number" step="0.1" value={draft.start_seconds ?? selected.start_seconds} onChange={(event) => setDraft((current) => ({ ...current, start_seconds: Number(event.target.value) }))} />
-                </label>
-                <label>结束秒
-                  <input type="number" step="0.1" value={draft.end_seconds ?? selected.end_seconds} onChange={(event) => setDraft((current) => ({ ...current, end_seconds: Number(event.target.value) }))} />
-                </label>
-              </div>
-              <label>台词文案
-                <textarea value={draft.text ?? selected.text} onChange={(event) => setDraft((current) => ({ ...current, text: event.target.value }))} rows={8} />
-              </label>
-              <div className="tag-line">
-                <span>{formatClockPrecise(selected.start_seconds)} - {formatClockPrecise(selected.end_seconds)}</span>
+                <CardFreeTagPicker
+                  label="卖点"
+                  values={splitMultiValue(draft.selling_points ?? selected.selling_points)}
+                  onChange={(values) => setDraft((current) => ({ ...current, selling_points: joinMultiValue(values) }))}
+                />
+                <CardFreeTagPicker
+                  label="画面"
+                  values={splitMultiValue(draft.visual_tags ?? selected.visual_tags)}
+                  onChange={(values) => setDraft((current) => ({ ...current, visual_tags: joinMultiValue(values) }))}
+                />
               </div>
             </>
           ) : (
@@ -2088,7 +3344,7 @@ function MultiValueEditor(props: { label: string; options: string[]; values: str
     <details className="inline-multi-select">
       <summary>
         <span>{props.label}</span>
-        <strong>{props.values.length > 0 ? props.values.join(" / ") : "未选择"}</strong>
+        <strong title={props.values.join(" / ")}>{formatCompactTags(props.values, "未选择")}</strong>
       </summary>
       <div className="inline-multi-menu">
         {props.options.map((option) => (
@@ -2102,6 +3358,28 @@ function MultiValueEditor(props: { label: string; options: string[]; values: str
   );
 }
 
+function formatCompactTags(values: string[], emptyLabel: string) {
+  if (values.length === 0) return emptyLabel;
+  const visible = values.slice(0, 2).join(" / ");
+  return values.length > 2 ? `${visible} / ...` : visible;
+}
+
+function CompactTagChips(props: { values: string[]; limit?: number }) {
+  const limit = props.limit ?? 2;
+  const visible = props.values.slice(0, limit);
+  const hidden = props.values.slice(limit);
+  return (
+    <>
+      {visible.map((tag) => <TagChip key={tag} tag={tag} />)}
+      {hidden.length > 0 && (
+        <span className="tag-chip tag-color-default tag-overflow-chip" data-overflow={hidden.join(" / ")} title={hidden.join(" / ")}>
+          ...
+        </span>
+      )}
+    </>
+  );
+}
+
 function SegmentCard(props: {
   segment: Segment;
   active: boolean;
@@ -2110,7 +3388,8 @@ function SegmentCard(props: {
   selectedForExport: boolean;
   onSelect: () => void;
   onNudge: (segment: Segment, boundary: "start" | "end", delta: number) => void;
-  onTagsChange: (segment: Segment, field: "semantic_type" | "position_type", values: string[]) => void;
+  onTagsChange: (segment: Segment, field: "semantic_type" | "position_type" | "selling_points" | "visual_tags", values: string[]) => void;
+  onTextChange: (segment: Segment, text: string) => void;
   onToggleExport: () => void;
   onSplit: () => void;
 }) {
@@ -2136,9 +3415,27 @@ function SegmentCard(props: {
         <strong>{duration.toFixed(1)}s</strong>
       </div>
       <div>
-        <div className="segment-type-line">{splitMultiValue(props.segment.semantic_type).map((tag) => <TagChip key={tag} tag={tag} />)}</div>
+        <div className="segment-type-line"><CompactTagChips values={splitMultiValue(props.segment.semantic_type)} /></div>
         <small>{formatClock(props.segment.start_seconds)} · 台词 {props.segment.text.length}字</small>
-        <p>{props.segment.text || "无转录文本"}</p>
+        <textarea
+          className="segment-card-textarea"
+          defaultValue={props.segment.text}
+          onBlur={(event) => {
+            const nextText = event.currentTarget.value.trim();
+            if (nextText !== props.segment.text) {
+              props.onTextChange(props.segment, nextText);
+            }
+          }}
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+          placeholder="无转录文本"
+          rows={4}
+        />
+        {(props.segment.selling_points || props.segment.visual_tags) && (
+          <small>
+            {[...splitMultiValue(props.segment.selling_points), ...splitMultiValue(props.segment.visual_tags)].slice(0, 5).join(" / ")}
+          </small>
+        )}
         {props.viewMode === "list" && <small>{props.segment.video_name}</small>}
       </div>
       <div className="tag-line">
@@ -2153,6 +3450,16 @@ function SegmentCard(props: {
           options={POSITION_TYPES}
           values={splitMultiValue(props.segment.position_type)}
           onChange={(values) => props.onTagsChange(props.segment, "position_type", values)}
+        />
+        <CardFreeTagPicker
+          label="卖点"
+          values={splitMultiValue(props.segment.selling_points)}
+          onChange={(values) => props.onTagsChange(props.segment, "selling_points", values)}
+        />
+        <CardFreeTagPicker
+          label="画面"
+          values={splitMultiValue(props.segment.visual_tags)}
+          onChange={(values) => props.onTagsChange(props.segment, "visual_tags", values)}
         />
       </div>
       <div className="card-micro-controls">
@@ -2444,7 +3751,7 @@ function CardTagPicker(props: { label: string; options: string[]; values: string
     >
       <summary>
         <span>{props.label}</span>
-        <strong>{props.values.length > 0 ? props.values.join(" / ") : "未选择"}</strong>
+        <strong title={props.values.join(" / ")}>{formatCompactTags(props.values, "未选择")}</strong>
       </summary>
       <div className="card-tag-menu">
         {props.options.map((option) => (
@@ -2453,6 +3760,35 @@ function CardTagPicker(props: { label: string; options: string[]; values: string
             {option}
           </label>
         ))}
+      </div>
+    </details>
+  );
+}
+
+function CardFreeTagPicker(props: { label: string; values: string[]; onChange: (values: string[]) => void }) {
+  const [draft, setDraft] = useState(props.values.join(","));
+  useEffect(() => setDraft(props.values.join(",")), [props.values.join(",")]);
+
+  function save() {
+    props.onChange(splitMultiValue(draft));
+  }
+
+  return (
+    <details
+      className="card-tag-picker"
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <summary>
+        <span>{props.label}</span>
+        <strong title={props.values.join(" / ")}>{formatCompactTags(props.values, "未填写")}</strong>
+      </summary>
+      <div className="card-tag-menu">
+        <label>
+          <span>{props.label} tag</span>
+          <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="逗号分隔" />
+        </label>
+        <button className="secondary" onClick={save}>保存</button>
       </div>
     </details>
   );
@@ -3006,7 +4342,7 @@ function SettingsView(props: { settings: Settings; onSaved: () => void; setMessa
     }
   }
 
-  async function test(target: "ai" | "asr") {
+  async function test(target: "ai" | "asr" | "tts") {
     try {
       const result = await api<{ message: string }>("/settings/test", {
         method: "POST",
@@ -3080,6 +4416,29 @@ function SettingsView(props: { settings: Settings; onSaved: () => void; setMessa
           <input value={draft.asr_model ?? ""} onChange={(event) => setValue("asr_model", event.target.value)} />
           <div className="action-row">
             <button className="secondary" onClick={() => test("asr")}>测试 ASR</button>
+            <button className="primary-action" onClick={save}>保存设置</button>
+          </div>
+        </div>
+        <div className="panel settings-panel">
+          <h2>TTS API</h2>
+          <label>兼容 TTS Base URL</label>
+          <input value={draft.tts_base_url ?? ""} onChange={(event) => setValue("tts_base_url", event.target.value)} placeholder="例如 OpenAI/Qwen 兼容语音服务地址" />
+          <label>TTS API Key</label>
+          <input value={draft.tts_api_key ?? ""} onChange={(event) => setValue("tts_api_key", event.target.value)} placeholder="本地服务可留空" />
+          <label>TTS 模型名</label>
+          <input value={draft.tts_model ?? ""} onChange={(event) => setValue("tts_model", event.target.value)} placeholder="例如 qwen-tts 或兼容模型名" />
+          <label>默认音色</label>
+          <input value={draft.tts_voice ?? "alloy"} onChange={(event) => setValue("tts_voice", event.target.value)} />
+          <label>音频格式</label>
+          <select value={draft.tts_format ?? "mp3"} onChange={(event) => setValue("tts_format", event.target.value)}>
+            <option value="mp3">mp3</option>
+            <option value="wav">wav</option>
+            <option value="aac">aac</option>
+            <option value="opus">opus</option>
+          </select>
+          <p className="field-hint">没有配置 TTS 时，配音中心会生成静音占位音频，方便先验证“文案语义填充素材”的完整流程。</p>
+          <div className="action-row">
+            <button className="secondary" onClick={() => test("tts")}>测试 TTS</button>
             <button className="primary-action" onClick={save}>保存设置</button>
           </div>
         </div>

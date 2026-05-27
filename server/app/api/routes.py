@@ -2,9 +2,11 @@ import asyncio
 import json
 import mimetypes
 import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -19,7 +21,10 @@ from app.services.material_store import (
     update_material_tag,
 )
 from app.services.workspace_store import (
+    add_asset,
+    create_ai_task,
     add_video,
+    add_script,
     create_project,
     create_scheme_set,
     delete_material_mix_timeline,
@@ -28,7 +33,9 @@ from app.services.workspace_store import (
     delete_scheme_segment,
     duplicate_material_mix_timeline,
     get_project,
+    get_asset,
     get_scheme,
+    get_script,
     get_segment,
     get_material_mix_timeline,
     get_segments_by_ids,
@@ -39,8 +46,11 @@ from app.services.workspace_store import (
     create_material_mix_timeline,
     delete_material_mix_clip,
     list_projects,
+    list_assets,
+    list_ai_tasks,
     list_material_mix_timelines,
     list_schemes,
+    list_scripts,
     list_segments,
     list_videos,
     move_scheme_segment,
@@ -50,11 +60,16 @@ from app.services.workspace_store import (
     update_project,
     update_segment,
     update_scheme_segment,
+    update_script,
     update_settings,
+    update_asset,
 )
 from app.services import workspace_store
 from app.services.providers import (
     ProviderError,
+    analyze_product_visual,
+    fallback_script_lines,
+    generate_script_lines,
     generate_schemes,
     public_settings,
     recommend_scheme_range,
@@ -65,6 +80,7 @@ from app.services.providers import (
 )
 from app.services.video_processor import (
     VideoProcessingError,
+    analyze_audio_loudness,
     create_preview_clip,
     create_segment_range_preview,
     create_segment_preview,
@@ -76,6 +92,7 @@ from app.services.video_processor import (
     export_segments,
     export_timeline,
     file_sha256,
+    probe_duration,
     probe_video,
     export_materials,
     save_upload,
@@ -197,18 +214,20 @@ class AppSettingsRequest(BaseModel):
 
 
 class SettingsTestRequest(BaseModel):
-    target: str = Field(pattern="^(ai|asr)$")
+    target: str = Field(pattern="^(ai|asr|tts)$")
 
 
 class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     custom_prompt: str = Field(default="", max_length=2000)
+    custom_tags: str = Field(default="", max_length=2000)
     category: str = Field(default="默认", max_length=40)
 
 
 class ProjectPatchRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     custom_prompt: str | None = Field(default=None, max_length=2000)
+    custom_tags: str | None = Field(default=None, max_length=2000)
     category: str | None = Field(default=None, min_length=1, max_length=40)
 
 
@@ -238,11 +257,17 @@ class SegmentPatchRequest(BaseModel):
     text: str | None = None
     semantic_type: str | None = None
     position_type: str | None = None
+    selling_points: str | None = None
+    visual_tags: str | None = None
+    visual_description: str | None = None
+    source_mode: str | None = None
+    keep_original_audio: bool | None = None
 
 
 class SegmentExportRequest(BaseModel):
     segment_ids: list[int] = Field(min_length=1)
     output_dir: str | None = None
+    export_tag: str = Field(default="", max_length=80)
 
 
 class SegmentDeleteRequest(BaseModel):
@@ -259,6 +284,11 @@ class SchemeExportRequest(BaseModel):
 
 class SegmentDedupeRequest(BaseModel):
     dry_run: bool = False
+
+
+class VisualBatchAnalyzeRequest(BaseModel):
+    limit: int = Field(default=20, ge=1, le=100)
+    only_missing: bool = True
 
 
 class MaterialMixTimelineCreateRequest(BaseModel):
@@ -280,17 +310,79 @@ class MaterialMixTimelinePatchRequest(BaseModel):
 
 class MaterialMixClipCreateRequest(BaseModel):
     segment_id: int
+    selection_note: str = Field(default="", max_length=500)
 
 
 class MaterialMixClipPatchRequest(BaseModel):
     segment_id: int | None = None
     source_in: float | None = Field(default=None, ge=0)
     source_out: float | None = Field(default=None, gt=0)
+    selection_note: str | None = Field(default=None, max_length=500)
     action: str | None = Field(default=None, pattern="^(move_up|move_down)$")
 
 
 class MaterialMixExportRequest(BaseModel):
     output_dir: str | None = None
+    audio_policy: str = Field(default="keep_original", pattern="^(keep_original|remove_original|enhance_voice|replace_with_voice|voice_over)$")
+    normalize_loudness: bool = False
+    target_lufs: float = Field(default=-14, ge=-24, le=-8)
+    subtitle_preset_id: int | None = None
+    burn_subtitles: bool = False
+    bgm_asset_id: int | None = None
+    voice_asset_id: int | None = None
+
+
+class AssetImportResponse(BaseModel):
+    assets: list[dict[str, object]]
+
+
+class AssetPatchRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    tags: str | None = Field(default=None, max_length=1000)
+    metadata: dict[str, object] | None = None
+
+
+class ScriptGenerateRequest(BaseModel):
+    project_id: int
+    source_text: str = Field(min_length=1, max_length=50000)
+    product_context: str = Field(default="", max_length=5000)
+    title: str = Field(default="AI 裂变文案", max_length=80)
+
+
+class DouyinScriptRequest(BaseModel):
+    project_id: int
+    douyin_url: str = Field(min_length=1, max_length=1000)
+    product_context: str = Field(default="", max_length=5000)
+    extracted_text: str = Field(default="", max_length=50000)
+
+
+class ScriptPatchRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    source_text: str | None = Field(default=None, max_length=50000)
+    product_context: str | None = Field(default=None, max_length=5000)
+    lines: list[dict[str, object]] | None = None
+
+
+class TtsGenerateRequest(BaseModel):
+    project_id: int
+    text: str = Field(min_length=1, max_length=20000)
+    title: str = Field(default="AI 口播配音", max_length=80)
+    voice: str = Field(default="", max_length=80)
+    script_id: int | None = None
+
+
+class VoiceTimelineRequest(BaseModel):
+    project_id: int
+    script_id: int
+    voice_asset_id: int | None = None
+    bgm_asset_id: int | None = None
+    target_clip_count: int | None = Field(default=None, ge=1, le=80)
+    name: str = Field(default="配音驱动成片", max_length=80)
+
+
+class RemoveBgmRequest(BaseModel):
+    asset_id: int | None = None
+    video_id: int | None = None
 
 
 MATERIAL_MIX_STRUCTURE = ["噱头引入", "痛点", "产品方案", "效果展示", "信任背书", "行动号召"]
@@ -458,9 +550,18 @@ async def test_settings(payload: SettingsTestRequest) -> dict[str, str]:
     try:
         if payload.target == "ai":
             return await test_ai_settings()
+        if payload.target == "tts":
+            return test_tts_settings()
         return await test_asr_settings()
     except ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def test_tts_settings() -> dict[str, str]:
+    settings = get_settings(masked=False)
+    if not settings.get("tts_base_url") or not settings.get("tts_model"):
+        return {"status": "ok", "message": "TTS 未配置，将使用静音占位音频跑通流程。"}
+    return {"status": "ok", "message": f"TTS 配置已填写：{settings.get('tts_model')}"}
 
 
 @router.get("/projects")
@@ -470,7 +571,10 @@ def get_projects() -> list[dict[str, object]]:
 
 @router.post("/projects")
 def post_project(payload: ProjectCreateRequest) -> dict[str, object]:
-    return create_project(payload.name.strip(), payload.custom_prompt.strip(), payload.category.strip() or "默认")
+    project = create_project(payload.name.strip(), payload.custom_prompt.strip(), payload.category.strip() or "默认")
+    if payload.custom_tags.strip():
+        project = update_project(int(project["id"]), custom_tags=payload.custom_tags.strip()) or project
+    return project
 
 
 @router.get("/projects/{project_id}")
@@ -505,7 +609,13 @@ def remove_project(project_id: int) -> dict[str, object]:
     return {"deleted": True, "project_id": project_id}
 
 
-async def _save_project_video(project_id: int, file: UploadFile) -> dict[str, object]:
+async def _save_project_video(
+    project_id: int,
+    file: UploadFile,
+    *,
+    asset_type: str = "finished_video",
+    source_mode: str = "finished_mix",
+) -> dict[str, object]:
     if get_project(project_id) is None:
         raise HTTPException(status_code=404, detail="Project not found.")
     ensure_data_dirs()
@@ -533,6 +643,12 @@ async def _save_project_video(project_id: int, file: UploadFile) -> dict[str, ob
             "width": metadata["width"],
             "height": metadata["height"],
             "fps": metadata["fps"],
+            "asset_type": asset_type,
+            "source_mode": source_mode,
+            "has_voice": asset_type in {"finished_video", "talking_head"},
+            "has_bgm": asset_type == "finished_video",
+            "has_captions": asset_type == "finished_video",
+            "keep_original_audio": asset_type in {"finished_video", "talking_head"},
             "status": "imported",
         },
     )
@@ -581,6 +697,195 @@ async def import_project_video(
         imported.append(video)
         background_tasks.add_task(_process_video_pipeline, int(video["id"]))
     return imported
+
+
+@router.post("/projects/{project_id}/assets/import", response_model=AssetImportResponse)
+async def import_project_assets(
+    project_id: int,
+    background_tasks: BackgroundTasks,
+    asset_type: str = Query(default="finished_video"),
+    files: list[UploadFile] = File(...),
+) -> AssetImportResponse:
+    if get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    allowed_asset_types = {
+        "finished_video",
+        "product_shot",
+        "benefit_shot",
+        "talking_head",
+        "bgm",
+        "voice",
+        "subtitle_preset",
+    }
+    if asset_type not in allowed_asset_types:
+        raise HTTPException(status_code=400, detail="不支持的素材类型。")
+    imported: list[dict[str, object]] = []
+    for file in files:
+        if asset_type in {"finished_video", "product_shot", "benefit_shot", "talking_head"}:
+            source_mode = "finished_mix" if asset_type in {"finished_video", "talking_head"} else "product_assets"
+            video = await _save_project_video(project_id, file, asset_type=asset_type, source_mode=source_mode)
+            imported.append({"kind": "video", **video})
+            if asset_type in {"finished_video", "talking_head"}:
+                background_tasks.add_task(_process_video_pipeline, int(video["id"]))
+            else:
+                workspace_store.replace_video_segments(
+                    int(video["id"]),
+                    [
+                        {
+                            "segment_index": "product_001",
+                            "start_seconds": 0,
+                            "end_seconds": float(video.get("duration_seconds") or 0),
+                            "text": "",
+                            "semantic_type": "产品方案" if asset_type == "product_shot" else "活动福利",
+                            "position_type": "中间",
+                            "visual_description": "",
+                            "source_mode": "product_assets",
+                            "keep_original_audio": 0,
+                            "thumbnail_path": str(video.get("thumbnail_path") or ""),
+                        }
+                    ],
+                )
+        else:
+            path = await save_upload(file)
+            duration = 0.0
+            try:
+                duration = probe_video(path)["duration_seconds"] if asset_type != "subtitle_preset" else 0.0
+            except VideoProcessingError:
+                try:
+                    duration = probe_duration(path)
+                except VideoProcessingError:
+                    duration = 0.0
+            asset = add_asset(
+                project_id=project_id,
+                asset_type=asset_type,
+                name=file.filename or path.name,
+                file_path=path,
+                source_path=path,
+                metadata={"original_name": file.filename or path.name},
+                duration_seconds=duration,
+            )
+            imported.append(asset)
+    return AssetImportResponse(assets=imported)
+
+
+@router.get("/projects/{project_id}/assets")
+def read_project_assets(project_id: int, asset_type: str = "") -> list[dict[str, object]]:
+    if get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return list_assets(project_id, asset_type)
+
+
+@router.get("/projects/{project_id}/ai-tasks")
+def read_project_ai_tasks(project_id: int, task_type: str = "") -> list[dict[str, object]]:
+    if get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return list_ai_tasks(project_id, task_type)
+
+
+@router.get("/assets/{asset_id}/file")
+def read_asset_file(asset_id: int) -> FileResponse:
+    asset = get_asset(asset_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    file_path = Path(str(asset.get("file_path") or ""))
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Asset file is missing.")
+    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    return FileResponse(file_path, media_type=media_type, filename=file_path.name)
+
+
+@router.post("/assets/{asset_id}/analyze-audio")
+def analyze_asset_audio(asset_id: int) -> dict[str, object]:
+    asset = get_asset(asset_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    if str(asset.get("asset_type") or "") not in {"bgm", "voice", "finished_video", "talking_head"}:
+        raise HTTPException(status_code=400, detail="该素材类型不支持响度分析。")
+    file_path = Path(str(asset.get("file_path") or ""))
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Asset file is missing.")
+    try:
+        analysis = analyze_audio_loudness(file_path)
+    except VideoProcessingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    metadata = dict(asset.get("metadata") or {})
+    metadata["audio_analysis"] = analysis
+    updated = update_asset(
+        asset_id,
+        metadata=metadata,
+        duration_seconds=float(analysis.get("duration_seconds") or asset.get("duration_seconds") or 0),
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    return updated
+
+
+@router.patch("/assets/{asset_id}")
+def patch_asset(asset_id: int, payload: AssetPatchRequest) -> dict[str, object]:
+    asset = get_asset(asset_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    updated = update_asset(asset_id, **payload.model_dump(exclude_unset=True))
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    return updated
+
+
+@router.post("/segments/{segment_id}/analyze-visual")
+async def analyze_segment_visual(segment_id: int) -> dict[str, object]:
+    segment = get_segment(segment_id)
+    if segment is None:
+        raise HTTPException(status_code=404, detail="Segment not found.")
+    project = get_project(int(segment["project_id"]))
+    try:
+        result = await analyze_product_visual(segment, str(project.get("custom_tags") or "") if project else "")
+    except ProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    updated = update_segment(
+        segment_id,
+        visual_description=result["visual_description"],
+        selling_points=",".join(result["selling_points"]),
+        visual_tags=",".join(result["visual_tags"]),
+        position_type=",".join(result["suitable_positions"]),
+        source_mode="product_assets",
+    )
+    return {"analysis": result, "segment": updated}
+
+
+@router.post("/projects/{project_id}/segments/analyze-visual")
+async def analyze_project_visual_segments(project_id: int, payload: VisualBatchAnalyzeRequest) -> dict[str, object]:
+    project = get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    candidates = [
+        segment
+        for segment in list_segments(project_id)
+        if str(segment.get("source_mode") or "") == "product_assets"
+        and (not payload.only_missing or not str(segment.get("visual_description") or "").strip())
+    ][: payload.limit]
+    analyzed: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = []
+    for segment in candidates:
+        try:
+            result = await analyze_product_visual(segment, str(project.get("custom_tags") or ""))
+            updated = update_segment(
+                int(segment["id"]),
+                visual_description=result["visual_description"],
+                selling_points=",".join(result["selling_points"]),
+                visual_tags=",".join(result["visual_tags"]),
+                position_type=",".join(result["suitable_positions"]),
+                source_mode="product_assets",
+            )
+            analyzed.append({"analysis": result, "segment": updated})
+        except ProviderError as exc:
+            errors.append({"segment_id": int(segment["id"]), "error": str(exc)})
+    return {
+        "checked_count": len(candidates),
+        "analyzed_count": len(analyzed),
+        "error_count": len(errors),
+        "analyzed": analyzed,
+        "errors": errors,
+    }
 
 
 @router.get("/projects/{project_id}/videos")
@@ -834,7 +1139,7 @@ def export_selected_segments(payload: SegmentExportRequest) -> dict[str, object]
         raise HTTPException(status_code=404, detail="Some selected segments were not found.")
     output_dir = Path(payload.output_dir).expanduser() if payload.output_dir else None
     try:
-        export_paths = export_segment_files(segments, output_dir)
+        export_paths = export_segment_files(segments, output_dir, payload.export_tag)
     except VideoProcessingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
@@ -946,13 +1251,14 @@ def generate_material_mix_timeline(payload: MaterialMixTimelineGenerateRequest) 
     if timeline is None:
         raise HTTPException(status_code=404, detail="Project not found.")
     for segment in selected_segments:
-        next_timeline = add_material_mix_clip(int(timeline["id"]), int(segment["id"]))
+        note = generation_notes.get(int(segment["id"]), "规则自动选择")
+        next_timeline = add_material_mix_clip(int(timeline["id"]), int(segment["id"]), note)
         if next_timeline is not None:
             timeline = next_timeline
     timeline = get_material_mix_timeline(int(timeline["id"])) or timeline
     timeline["generation_warnings"] = warnings
     timeline["generation_notes"] = {
-        int(clip["clip_id"]): generation_notes.get(int(clip["segment_id"]), "规则自动选择")
+        int(clip["clip_id"]): str(clip.get("selection_note") or generation_notes.get(int(clip["segment_id"]), "规则自动选择"))
         for clip in timeline.get("clips", [])
     }
     timeline["requirement_prompt"] = payload.requirement_prompt
@@ -999,7 +1305,7 @@ def duplicate_material_mix(timeline_id: int) -> dict[str, object]:
 def add_material_mix_timeline_clip(timeline_id: int, payload: MaterialMixClipCreateRequest) -> dict[str, object]:
     if get_segment(payload.segment_id) is None:
         raise HTTPException(status_code=404, detail="Segment not found.")
-    timeline = add_material_mix_clip(timeline_id, payload.segment_id)
+    timeline = add_material_mix_clip(timeline_id, payload.segment_id, payload.selection_note)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found or segment is outside this project.")
     return timeline
@@ -1035,6 +1341,7 @@ def patch_material_mix_timeline_clip(timeline_id: int, clip_id: int, payload: Ma
         segment_id=payload.segment_id,
         source_in=payload.source_in,
         source_out=payload.source_out,
+        selection_note=payload.selection_note,
         action=payload.action,
     )
     if timeline is None:
@@ -1083,6 +1390,17 @@ def export_material_mix_timeline(timeline_id: int, payload: MaterialMixExportReq
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found.")
     try:
+        if payload:
+            timeline = update_material_mix_timeline(
+                timeline_id,
+                voice_asset_id=payload.voice_asset_id,
+                bgm_asset_id=payload.bgm_asset_id,
+                subtitle_preset_id=payload.subtitle_preset_id,
+                audio_policy=payload.audio_policy,
+                normalize_loudness=payload.normalize_loudness,
+                target_lufs=payload.target_lufs,
+                burn_subtitles=payload.burn_subtitles,
+            ) or timeline
         output_dir = Path(payload.output_dir).expanduser() if payload and payload.output_dir else None
         export_path = export_timeline(timeline, output_dir=output_dir)
     except VideoProcessingError as exc:
@@ -1200,6 +1518,188 @@ async def analyze_script(payload: ScriptAnalyzeRequest) -> ScriptAnalyzeResponse
     except DeepSeekError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return ScriptAnalyzeResponse(result=result)
+
+
+@router.get("/projects/{project_id}/scripts")
+def read_project_scripts(project_id: int) -> list[dict[str, object]]:
+    if get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return list_scripts(project_id)
+
+
+@router.post("/scripts/generate-variants")
+async def generate_script_variants(payload: ScriptGenerateRequest) -> dict[str, object]:
+    if get_project(payload.project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    try:
+        lines = await generate_script_lines(
+            source_text=payload.source_text,
+            product_context=payload.product_context,
+            source_type="manual",
+        )
+    except ProviderError:
+        lines = fallback_script_lines(payload.source_text)
+    script = add_script(
+        project_id=payload.project_id,
+        title=payload.title,
+        source_type="manual",
+        source_text=payload.source_text,
+        product_context=payload.product_context,
+        lines=lines,
+    )
+    return script
+
+
+@router.post("/scripts/from-douyin")
+async def generate_script_from_douyin(payload: DouyinScriptRequest) -> dict[str, object]:
+    if get_project(payload.project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    source_text = payload.extracted_text.strip() or f"抖音链接：{payload.douyin_url}"
+    try:
+        lines = await generate_script_lines(
+            source_text=source_text,
+            product_context=payload.product_context,
+            source_type="douyin",
+        )
+    except ProviderError:
+        lines = fallback_script_lines(source_text)
+    script = add_script(
+        project_id=payload.project_id,
+        title="抖音结构改写文案",
+        source_type="douyin",
+        source_text=source_text,
+        product_context=payload.product_context,
+        lines=lines,
+    )
+    return script
+
+
+@router.patch("/scripts/{script_id}")
+def patch_script(script_id: int, payload: ScriptPatchRequest) -> dict[str, object]:
+    script = get_script(script_id)
+    if script is None:
+        raise HTTPException(status_code=404, detail="Script not found.")
+    values = payload.model_dump(exclude_unset=True)
+    if "lines" in values and values["lines"] is not None:
+        values["lines"] = _normalize_script_patch_lines(values["lines"])
+    updated = update_script(script_id, **values)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Script not found.")
+    return updated
+
+
+@router.post("/tts/generate")
+async def generate_tts_voice(payload: TtsGenerateRequest) -> dict[str, object]:
+    if get_project(payload.project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    try:
+        audio_path, metadata = await _generate_tts_audio(payload)
+    except ProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    duration = metadata.get("duration_seconds", 0.0)
+    if not duration:
+        try:
+            duration = probe_duration(audio_path)
+        except VideoProcessingError:
+            duration = 0.0
+    asset = add_asset(
+        project_id=payload.project_id,
+        asset_type="voice",
+        name=payload.title,
+        file_path=audio_path,
+        source_path=audio_path,
+        tags=payload.voice or "",
+        metadata={**metadata, "script_id": payload.script_id, "text": payload.text},
+        duration_seconds=float(duration),
+    )
+    return asset
+
+
+@router.post("/timelines/generate-from-voice")
+def generate_timeline_from_voice(payload: VoiceTimelineRequest) -> dict[str, object]:
+    project = get_project(payload.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    script = get_script(payload.script_id)
+    if script is None or int(script["project_id"]) != payload.project_id:
+        raise HTTPException(status_code=404, detail="Script not found.")
+    segments = list_segments(payload.project_id)
+    if not segments:
+        raise HTTPException(status_code=400, detail="当前项目还没有可用素材片段。")
+    lines = list(script.get("lines") or [])
+    selected = _match_segments_for_script(lines, segments, payload.target_clip_count)
+    if not selected:
+        raise HTTPException(status_code=400, detail="没有匹配到可用素材片段。")
+    timeline = create_material_mix_timeline(payload.project_id, payload.name or "配音驱动成片")
+    if not timeline:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    notes_by_segment_id: dict[int, str] = {}
+    for index, segment in enumerate(selected):
+        line = lines[index] if index < len(lines) and isinstance(lines[index], dict) else {}
+        note = _script_segment_note(index, line, segment)
+        next_timeline = add_material_mix_clip(int(timeline["id"]), int(segment["id"]), note)
+        if next_timeline is not None:
+            timeline = next_timeline
+            clip = timeline.get("clips", [])[-1] if timeline.get("clips") else None
+            if isinstance(clip, dict):
+                source_in = float(clip["source_in"])
+                source_out = float(clip["source_out"])
+                try:
+                    desired_duration = float(line.get("estimated_duration") or source_out - source_in)
+                except (TypeError, ValueError):
+                    desired_duration = source_out - source_in
+                desired_duration = max(0.3, desired_duration)
+                next_out = min(source_out, source_in + desired_duration)
+                if next_out - source_in >= 0.3 and next_out < source_out:
+                    trimmed = update_material_mix_clip(int(timeline["id"]), int(clip["clip_id"]), source_in=source_in, source_out=next_out)
+                    if trimmed is not None:
+                        timeline = trimmed
+                notes_by_segment_id[int(segment["id"])] = note
+    timeline = update_material_mix_timeline(
+        int(timeline["id"]),
+        voice_asset_id=payload.voice_asset_id,
+        bgm_asset_id=payload.bgm_asset_id,
+        audio_policy="replace_with_voice" if payload.voice_asset_id else "remove_original",
+        normalize_loudness=True,
+        target_lufs=-14,
+        burn_subtitles=True,
+    ) or timeline
+    timeline["generation_notes"] = {
+        int(clip["clip_id"]): str(clip.get("selection_note") or notes_by_segment_id.get(int(clip["segment_id"]), "按口播语义匹配素材"))
+        for clip in timeline.get("clips", [])
+    }
+    return timeline
+
+
+@router.post("/audio/remove-bgm")
+def remove_bgm(payload: RemoveBgmRequest) -> dict[str, object]:
+    target: dict[str, object] | None = None
+    target_type = "asset"
+    project_id: int | None = None
+    if payload.asset_id:
+        target = get_asset(payload.asset_id)
+        project_id = int(target["project_id"]) if target and target.get("project_id") else None
+    if payload.video_id:
+        target = get_video(payload.video_id)
+        target_type = "video"
+        project_id = int(target["project_id"]) if target and target.get("project_id") else None
+    if not target:
+        raise HTTPException(status_code=404, detail="没有找到要处理的素材。")
+    task = create_ai_task(
+        project_id=project_id,
+        task_type="remove_bgm",
+        target_type=target_type,
+        target_id=int(payload.video_id or payload.asset_id or 0),
+        status="waiting_worker",
+        message="等待可选 AI Worker（Demucs/UVR）启用后处理。",
+        metadata={"target_name": target.get("name") or target.get("source_name") or target.get("local_path") or ""},
+    )
+    return {
+        "status": "waiting_worker",
+        "message": "已创建去 BGM 任务；启用可选 AI Worker 后会处理人声/BGM 分离。",
+        "task": task,
+        "target": target,
+    }
 
 
 @router.get("/materials", response_model=list[Material])
@@ -1433,3 +1933,165 @@ def _validate_mix_requirements(items: list[dict[str, str]]) -> list[MixRequireme
     if not requirements:
         raise HTTPException(status_code=502, detail="AI 没有生成可用的混剪结构。")
     return requirements
+
+
+async def _generate_tts_audio(payload: TtsGenerateRequest) -> tuple[Path, dict[str, object]]:
+    settings = get_settings(masked=False)
+    tts_dir = TMP_DIR / "tts" / uuid.uuid4().hex
+    tts_dir.mkdir(parents=True, exist_ok=True)
+    output_path = tts_dir / "voice.mp3"
+    base_url = settings.get("tts_base_url", "").strip().rstrip("/")
+    model = settings.get("tts_model", "").strip()
+    if base_url and model:
+        headers: dict[str, str] = {}
+        api_key = settings.get("tts_api_key", "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        voice = payload.voice or settings.get("tts_voice") or "alloy"
+        audio_format = settings.get("tts_format") or "mp3"
+        url = f"{base_url}/audio/speech"
+        async with httpx.AsyncClient(timeout=180) as client:
+            response = await client.post(
+                url,
+                headers=headers,
+                json={
+                    "model": model,
+                    "voice": voice,
+                    "input": payload.text,
+                    "response_format": audio_format,
+                },
+            )
+        if response.status_code >= 400:
+            raise ProviderError(f"TTS API 请求失败：{response.status_code} {response.text}")
+        output_path = output_path.with_suffix(f".{audio_format}")
+        output_path.write_bytes(response.content)
+        return output_path, {"provider": "compatible_tts", "voice": voice}
+
+    duration = max(1.5, min(180.0, len(payload.text) / 5.2))
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=44100:cl=stereo",
+            "-t",
+            f"{duration:.2f}",
+            "-c:a",
+            "mp3",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ProviderError(result.stderr.strip() or "生成占位配音失败。")
+    return output_path, {
+        "provider": "placeholder",
+        "duration_seconds": duration,
+        "message": "未配置 TTS Base URL/模型，已生成静音占位音频用于跑通时间线流程。",
+    }
+
+
+def _match_segments_for_script(
+    lines: list[object],
+    segments: list[dict[str, object]],
+    target_clip_count: int | None,
+) -> list[dict[str, object]]:
+    limit = target_clip_count or len(lines) or min(8, len(segments))
+    selected: list[dict[str, object]] = []
+    used_ids: set[int] = set()
+    for line in lines[:limit]:
+        line_data = line if isinstance(line, dict) else {}
+        semantic = str(line_data.get("semantic_type") or "")
+        selling_points = _split_multi_value(",".join(str(item) for item in line_data.get("selling_points", []))) if isinstance(line_data.get("selling_points"), list) else _split_multi_value(line_data.get("selling_points"))
+        visual_needs = _split_multi_value(",".join(str(item) for item in line_data.get("visual_needs", []))) if isinstance(line_data.get("visual_needs"), list) else _split_multi_value(line_data.get("visual_needs"))
+        candidates = [segment for segment in segments if int(segment["id"]) not in used_ids]
+        if not candidates:
+            break
+        picked = max(
+            candidates,
+            key=lambda segment: _script_segment_score(segment, semantic, selling_points, visual_needs),
+        )
+        selected.append(picked)
+        used_ids.add(int(picked["id"]))
+    if not selected:
+        selected = segments[: min(limit, len(segments))]
+    return selected
+
+
+def _normalize_script_patch_lines(lines: list[dict[str, object]]) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    for index, raw in enumerate(lines, start=1):
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            continue
+        semantic_type = str(raw.get("semantic_type") or "过渡").strip()
+        if semantic_type not in ALLOWED_TAGS:
+            semantic_type = "过渡"
+        try:
+            estimated_duration = float(raw.get("estimated_duration") or max(1.5, len(text) / 5.2))
+        except (TypeError, ValueError):
+            estimated_duration = max(1.5, len(text) / 5.2)
+        normalized.append(
+            {
+                "line_index": int(raw.get("line_index") or index),
+                "text": text,
+                "semantic_type": semantic_type,
+                "selling_points": _split_multi_value(",".join(str(item) for item in raw.get("selling_points", []))) if isinstance(raw.get("selling_points"), list) else _split_multi_value(raw.get("selling_points")),
+                "visual_needs": _split_multi_value(",".join(str(item) for item in raw.get("visual_needs", []))) if isinstance(raw.get("visual_needs"), list) else _split_multi_value(raw.get("visual_needs")),
+                "estimated_duration": round(max(0.8, estimated_duration), 1),
+            }
+        )
+    return normalized
+
+
+def _script_segment_score(segment: dict[str, object], semantic: str, selling_points: list[str], visual_needs: list[str]) -> float:
+    score = 0.0
+    if semantic and semantic in _split_multi_value(segment.get("semantic_type")):
+        score += 5
+    segment_text = " ".join(
+        [
+            str(segment.get("text") or ""),
+            str(segment.get("visual_description") or ""),
+            str(segment.get("selling_points") or ""),
+            str(segment.get("visual_tags") or ""),
+            str(segment.get("semantic_type") or ""),
+        ]
+    )
+    for value in selling_points:
+        if value and value in segment_text:
+            score += 3
+    for value in visual_needs:
+        if value and value in segment_text:
+            score += 2
+    if str(segment.get("source_mode") or "") == "product_assets":
+        score += 1
+    return score
+
+
+def _script_segment_note(index: int, line: dict[str, object], segment: dict[str, object]) -> str:
+    line_text = str(line.get("text") or "").strip()
+    semantic = str(line.get("semantic_type") or "").strip()
+    selling_points = _split_multi_value(",".join(str(item) for item in line.get("selling_points", []))) if isinstance(line.get("selling_points"), list) else _split_multi_value(line.get("selling_points"))
+    visual_needs = _split_multi_value(",".join(str(item) for item in line.get("visual_needs", []))) if isinstance(line.get("visual_needs"), list) else _split_multi_value(line.get("visual_needs"))
+    segment_tags = set(
+        _split_multi_value(segment.get("semantic_type"))
+        + _split_multi_value(segment.get("selling_points"))
+        + _split_multi_value(segment.get("visual_tags"))
+    )
+    matched = [value for value in selling_points + visual_needs if value in segment_tags]
+    parts = [f"匹配口播第 {index + 1} 句"]
+    if line_text:
+        parts.append(f"「{line_text[:24]}」")
+    if semantic:
+        parts.append(f"语义：{semantic}")
+    if matched:
+        parts.append(f"命中：{' / '.join(matched[:4])}")
+    elif str(segment.get("source_mode") or "") == "product_assets":
+        parts.append("优先使用产品素材")
+    return "，".join(parts)

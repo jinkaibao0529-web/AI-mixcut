@@ -67,6 +67,58 @@ def has_audio_stream(video_path: Path) -> bool:
     return bool(data.get("streams"))
 
 
+def analyze_audio_loudness(media_path: Path, target_lufs: float = -14.0) -> dict[str, object]:
+    if not media_path.exists():
+        raise VideoProcessingError("音频素材文件不存在。")
+    if not has_audio_stream(media_path):
+        raise VideoProcessingError("素材没有可分析的音频流。")
+
+    duration = 0.0
+    try:
+        duration = probe_duration(media_path)
+    except VideoProcessingError:
+        duration = 0.0
+
+    result = _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(media_path),
+            "-af",
+            f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11:print_format=json",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    output = result.stderr or result.stdout
+    json_start = output.rfind("{")
+    json_end = output.rfind("}")
+    if json_start < 0 or json_end <= json_start:
+        raise VideoProcessingError("响度分析失败：FFmpeg 未返回 loudnorm 数据。")
+    try:
+        loudnorm = json.loads(output[json_start : json_end + 1])
+    except json.JSONDecodeError as exc:
+        raise VideoProcessingError("响度分析失败：loudnorm 数据解析失败。") from exc
+
+    return {
+        "duration_seconds": duration,
+        "target_lufs": target_lufs,
+        "input_i": loudnorm.get("input_i"),
+        "input_tp": loudnorm.get("input_tp"),
+        "input_lra": loudnorm.get("input_lra"),
+        "input_thresh": loudnorm.get("input_thresh"),
+        "output_i": loudnorm.get("output_i"),
+        "output_tp": loudnorm.get("output_tp"),
+        "output_lra": loudnorm.get("output_lra"),
+        "output_thresh": loudnorm.get("output_thresh"),
+        "normalization_type": loudnorm.get("normalization_type"),
+        "target_offset": loudnorm.get("target_offset"),
+    }
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -397,6 +449,7 @@ def export_timeline(timeline: dict[str, object], output_dir: Path | None = None)
             preset="veryfast",
             crf="23",
             faststart=False,
+            include_audio=str(timeline.get("audio_policy") or "keep_original") not in {"remove_original", "replace_with_voice"},
         )
         normalized_paths.append(normalized_path)
 
@@ -407,7 +460,7 @@ def export_timeline(timeline: dict[str, object], output_dir: Path | None = None)
     target_dir = output_dir or EXPORTS_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     timeline_id = timeline.get("id") or timeline.get("timeline_id") or "timeline"
-    export_path = target_dir / f"material_mix_{timeline_id}_{export_id}.mp4"
+    raw_export_path = normalized_dir / "timeline_concat.mp4"
     _run(
         [
             "ffmpeg",
@@ -420,9 +473,11 @@ def export_timeline(timeline: dict[str, object], output_dir: Path | None = None)
             str(concat_list_path),
             "-c",
             "copy",
-            str(export_path),
+            str(raw_export_path),
         ]
     )
+    export_path = target_dir / f"material_mix_{timeline_id}_{export_id}.mp4"
+    _finalize_timeline_export(raw_export_path, export_path, timeline, normalized_dir)
     return export_path
 
 
@@ -502,6 +557,7 @@ def _encode_precise_clip(
     preset: str,
     crf: str,
     faststart: bool,
+    include_audio: bool = True,
 ) -> None:
     command = [
         "ffmpeg",
@@ -511,7 +567,7 @@ def _encode_precise_clip(
         "-avoid_negative_ts",
         "make_zero",
     ]
-    if has_audio_stream(source_path):
+    if include_audio and has_audio_stream(source_path):
         command.extend(
             [
                 "-filter_complex",
@@ -545,6 +601,196 @@ def _encode_precise_clip(
         command.extend(["-movflags", "+faststart"])
     command.append(str(target_path))
     _run(command)
+
+
+def _finalize_timeline_export(source_path: Path, export_path: Path, timeline: dict[str, object], work_dir: Path) -> None:
+    audio_policy = str(timeline.get("audio_policy") or "keep_original")
+    normalize_loudness = bool(int(timeline.get("normalize_loudness") or 0))
+    target_lufs = float(timeline.get("target_lufs") or -14)
+    bgm_path = _asset_path_from_timeline(timeline, "bgm_asset")
+    voice_path = _asset_path_from_timeline(timeline, "voice_asset")
+    burn_subtitles = bool(int(timeline.get("burn_subtitles") or 0))
+    subtitle_path = _write_timeline_subtitles(timeline, work_dir) if burn_subtitles else None
+
+    needs_processing = (
+        normalize_loudness
+        or burn_subtitles
+        or bool(bgm_path)
+        or bool(voice_path)
+        or audio_policy in {"remove_original", "replace_with_voice"}
+    )
+    if not needs_processing:
+        shutil.copy2(source_path, export_path)
+        return
+
+    command = ["ffmpeg", "-y", "-i", str(source_path)]
+    input_audio_labels: list[str] = []
+    next_input_index = 1
+    has_original_audio = has_audio_stream(source_path)
+    if voice_path and voice_path.exists():
+        command.extend(["-i", str(voice_path)])
+        input_audio_labels.append(f"[{next_input_index}:a]volume=1.0[voice]")
+        voice_label = "[voice]"
+        next_input_index += 1
+    else:
+        voice_label = ""
+    if bgm_path and bgm_path.exists():
+        command.extend(["-stream_loop", "-1", "-i", str(bgm_path)])
+        input_audio_labels.append(f"[{next_input_index}:a]volume=0.18[bgm]")
+        bgm_label = "[bgm]"
+        next_input_index += 1
+    else:
+        bgm_label = ""
+
+    filters: list[str] = []
+    video_label = "0:v"
+    if subtitle_path:
+        filters.append(f"[0:v]subtitles='{_escape_filter_path(subtitle_path)}'[vout]")
+        video_label = "vout"
+
+    audio_sources: list[str] = []
+    if has_original_audio and audio_policy not in {"remove_original", "replace_with_voice"}:
+        audio_sources.append("[0:a]")
+    if voice_label:
+        filters.extend(input_audio_labels[:1])
+        audio_sources.append(voice_label)
+    if bgm_label:
+        filters.extend(input_audio_labels[1:] if voice_label else input_audio_labels[:1])
+        audio_sources.append(bgm_label)
+
+    audio_label = ""
+    if audio_sources:
+        if len(audio_sources) == 1:
+            if normalize_loudness:
+                filters.append(f"{audio_sources[0]}loudnorm=I={target_lufs:.1f}:TP=-1.5:LRA=11[aout]")
+                audio_label = "aout"
+            else:
+                audio_label = audio_sources[0].strip("[]")
+        else:
+            mixed = "".join(audio_sources)
+            loudnorm = f",loudnorm=I={target_lufs:.1f}:TP=-1.5:LRA=11" if normalize_loudness else ""
+            filters.append(f"{mixed}amix=inputs={len(audio_sources)}:duration=first:dropout_transition=0{loudnorm}[aout]")
+            audio_label = "aout"
+
+    if filters:
+        command.extend(["-filter_complex", ";".join(filters)])
+    command.extend(["-map", f"[{video_label}]" if video_label == "vout" else "0:v"])
+    if audio_label:
+        command.extend(["-map", f"[{audio_label}]" if audio_label not in {"0:a"} else "0:a", "-c:a", "aac", "-ar", "44100", "-ac", "2"])
+    else:
+        command.append("-an")
+    command.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-movflags", "+faststart", "-shortest", str(export_path)])
+    _run(command)
+
+
+def _asset_path_from_timeline(timeline: dict[str, object], key: str) -> Path | None:
+    asset = timeline.get(key)
+    if isinstance(asset, dict) and asset.get("file_path"):
+        return Path(str(asset["file_path"]))
+    return None
+
+
+def _write_timeline_subtitles(timeline: dict[str, object], work_dir: Path) -> Path:
+    ass_path = work_dir / "timeline_subtitles.ass"
+    clips = list(timeline.get("clips", []))
+    style = _timeline_subtitle_style(timeline)
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 1080",
+        "PlayResY: 1920",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        style,
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for clip in clips:
+        text = _escape_ass_text(str(clip.get("text") or ""))
+        if not text:
+            continue
+        lines.append(
+            f"Dialogue: 0,{_ass_time(float(clip.get('timeline_in') or 0))},{_ass_time(float(clip.get('timeline_out') or 0))},Default,,0,0,0,,{text}"
+        )
+    ass_path.write_text("\n".join(lines), encoding="utf-8")
+    return ass_path
+
+
+def _timeline_subtitle_style(timeline: dict[str, object]) -> str:
+    preset = timeline.get("subtitle_preset")
+    if not isinstance(preset, dict):
+        return _ass_style_line({})
+    metadata = preset.get("metadata")
+    if isinstance(metadata, dict):
+        style_data = metadata.get("subtitle_style")
+        if isinstance(style_data, dict):
+            return _ass_style_line(style_data)
+    preset_path = Path(str(preset.get("file_path") or ""))
+    if not preset_path.exists():
+        return _ass_style_line({})
+    if preset_path.suffix.lower() == ".ass":
+        try:
+            return _extract_ass_default_style(preset_path) or _ass_style_line({})
+        except UnicodeDecodeError:
+            return _ass_style_line({})
+    if preset_path.suffix.lower() == ".json":
+        try:
+            data = json.loads(preset_path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return _ass_style_line({})
+        return _ass_style_line(data if isinstance(data, dict) else {})
+    return _ass_style_line({})
+
+
+def _extract_ass_default_style(path: Path) -> str:
+    content = path.read_text(encoding="utf-8-sig")
+    first_style = ""
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("style:"):
+            continue
+        if not first_style:
+            first_style = stripped
+        name = stripped.split(":", 1)[1].split(",", 1)[0].strip().lower()
+        if name == "default":
+            return stripped
+    return first_style
+
+
+def _ass_style_line(data: dict[str, object]) -> str:
+    font = str(data.get("font") or data.get("fontname") or "Arial")
+    size = int(float(data.get("size") or data.get("font_size") or 64))
+    primary = str(data.get("primary_color") or data.get("color") or "&H00FFFFFF")
+    outline_color = str(data.get("outline_color") or "&H00111111")
+    back_color = str(data.get("back_color") or "&H66000000")
+    bold = 1 if data.get("bold", True) else 0
+    outline = float(data.get("outline") or 4)
+    shadow = float(data.get("shadow") or 1)
+    alignment = int(data.get("alignment") or 2)
+    margin_v = int(data.get("margin_v") or 150)
+    return (
+        f"Style: Default,{font},{size},{primary},&H000000FF,{outline_color},{back_color},"
+        f"{bold},0,0,0,100,100,0,0,1,{outline:g},{shadow:g},{alignment},72,72,{margin_v},1"
+    )
+
+
+def _ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    whole = int(seconds % 60)
+    centiseconds = int(round((seconds - int(seconds)) * 100))
+    return f"{hours}:{minutes:02d}:{whole:02d}.{centiseconds:02d}"
+
+
+def _escape_ass_text(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
+
+
+def _escape_filter_path(path: Path) -> str:
+    return path.as_posix().replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
 
 
 def _clip_bounds(segment: dict[str, object], *, pre_roll: float = 0.0, post_roll: float = 0.0) -> tuple[float, float, float]:
@@ -640,7 +886,7 @@ def _semantic_export_tags(value: object) -> list[str]:
     return tags or ["过渡"]
 
 
-def export_segment_files(segments: list[dict[str, object]], output_dir: Path | None = None) -> list[Path]:
+def export_segment_files(segments: list[dict[str, object]], output_dir: Path | None = None, export_tag: str = "") -> list[Path]:
     ensure_data_dirs()
     if not segments:
         raise VideoProcessingError("No segments selected for export.")
@@ -655,7 +901,7 @@ def export_segment_files(segments: list[dict[str, object]], output_dir: Path | N
             raise VideoProcessingError("Invalid segment timing.")
         project_name = _safe_export_name(str(segment.get("project_name") or f"project_{segment.get('project_id', 'unknown')}"))
         project_dir = (output_dir or EXPORTS_DIR) / project_name
-        tags = _semantic_export_tags(segment.get("semantic_type"))
+        tags = [_safe_export_name(export_tag)] if export_tag.strip() else _semantic_export_tags(segment.get("semantic_type"))
         segment_id = int(segment["id"])
         video_name = _safe_export_name(Path(str(segment.get("video_name") or "video")).stem)
         output_name = f"{index:02d}_{segment_id}_{video_name}_{int(start_seconds * 1000)}_{int(video_end_seconds * 1000)}.mp4"

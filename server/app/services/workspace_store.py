@@ -27,6 +27,7 @@ def init_workspace_db() -> None:
                 name TEXT NOT NULL,
                 category TEXT NOT NULL DEFAULT '默认',
                 custom_prompt TEXT NOT NULL DEFAULT '',
+                custom_tags TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -43,6 +44,12 @@ def init_workspace_db() -> None:
                 width INTEGER NOT NULL DEFAULT 0,
                 height INTEGER NOT NULL DEFAULT 0,
                 fps REAL NOT NULL DEFAULT 0,
+                asset_type TEXT NOT NULL DEFAULT 'finished_video',
+                source_mode TEXT NOT NULL DEFAULT 'finished_mix',
+                has_voice INTEGER NOT NULL DEFAULT 1,
+                has_bgm INTEGER NOT NULL DEFAULT 0,
+                has_captions INTEGER NOT NULL DEFAULT 0,
+                keep_original_audio INTEGER NOT NULL DEFAULT 1,
                 transcript TEXT NOT NULL DEFAULT '',
                 transcript_segments TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'imported',
@@ -61,6 +68,10 @@ def init_workspace_db() -> None:
                 text TEXT NOT NULL DEFAULT '',
                 semantic_type TEXT NOT NULL DEFAULT '过渡',
                 position_type TEXT NOT NULL DEFAULT '中间',
+                selling_points TEXT NOT NULL DEFAULT '',
+                visual_tags TEXT NOT NULL DEFAULT '',
+                source_mode TEXT NOT NULL DEFAULT 'finished_mix',
+                keep_original_audio INTEGER NOT NULL DEFAULT 1,
                 visual_description TEXT NOT NULL DEFAULT '',
                 thumbnail_path TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -116,6 +127,13 @@ def init_workspace_db() -> None:
                 project_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 is_favorite INTEGER NOT NULL DEFAULT 0,
+                voice_asset_id INTEGER,
+                bgm_asset_id INTEGER,
+                subtitle_preset_id INTEGER,
+                audio_policy TEXT NOT NULL DEFAULT 'keep_original',
+                normalize_loudness INTEGER NOT NULL DEFAULT 0,
+                target_lufs REAL NOT NULL DEFAULT -14,
+                burn_subtitles INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(project_id) REFERENCES projects(id)
@@ -130,15 +148,76 @@ def init_workspace_db() -> None:
                 source_out REAL NOT NULL,
                 track_type TEXT NOT NULL DEFAULT 'video',
                 position INTEGER NOT NULL,
+                selection_note TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(timeline_id) REFERENCES material_mix_timelines(id),
                 FOREIGN KEY(segment_id) REFERENCES segments(id)
             );
+
+            CREATE TABLE IF NOT EXISTS assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                asset_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                source_path TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                duration_seconds REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'ready',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS scripts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                source_text TEXT NOT NULL DEFAULT '',
+                product_context TEXT NOT NULL DEFAULT '',
+                lines TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS ai_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                task_type TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                message TEXT NOT NULL DEFAULT '',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+            );
             """
         )
         _ensure_column(connection, "projects", "category", "TEXT NOT NULL DEFAULT '默认'")
+        _ensure_column(connection, "projects", "custom_tags", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "videos", "transcript_segments", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(connection, "videos", "asset_type", "TEXT NOT NULL DEFAULT 'finished_video'")
+        _ensure_column(connection, "videos", "source_mode", "TEXT NOT NULL DEFAULT 'finished_mix'")
+        _ensure_column(connection, "videos", "has_voice", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(connection, "videos", "has_bgm", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "videos", "has_captions", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "videos", "keep_original_audio", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(connection, "segments", "selling_points", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "segments", "visual_tags", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "segments", "source_mode", "TEXT NOT NULL DEFAULT 'finished_mix'")
+        _ensure_column(connection, "segments", "keep_original_audio", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(connection, "material_mix_timelines", "is_favorite", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "material_mix_timelines", "voice_asset_id", "INTEGER")
+        _ensure_column(connection, "material_mix_timelines", "bgm_asset_id", "INTEGER")
+        _ensure_column(connection, "material_mix_timelines", "subtitle_preset_id", "INTEGER")
+        _ensure_column(connection, "material_mix_timelines", "audio_policy", "TEXT NOT NULL DEFAULT 'keep_original'")
+        _ensure_column(connection, "material_mix_timelines", "normalize_loudness", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "material_mix_timelines", "target_lufs", "REAL NOT NULL DEFAULT -14")
+        _ensure_column(connection, "material_mix_timelines", "burn_subtitles", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "material_mix_clips", "selection_note", "TEXT NOT NULL DEFAULT ''")
         _seed_settings(connection)
 
 
@@ -168,6 +247,11 @@ def _seed_settings(connection: sqlite3.Connection) -> None:
         "aliyun_access_key_secret": "",
         "aliyun_app_key": "",
         "aliyun_region": "cn-shanghai",
+        "tts_base_url": "",
+        "tts_api_key": "",
+        "tts_model": "",
+        "tts_voice": "alloy",
+        "tts_format": "mp3",
     }
     for key, value in defaults.items():
         connection.execute(
@@ -203,7 +287,7 @@ def get_settings(*, masked: bool = False) -> dict[str, str]:
         rows = connection.execute("SELECT key, value FROM settings").fetchall()
     values = {str(row["key"]): str(row["value"]) for row in rows}
     if masked:
-        for key in ("ai_api_key", "asr_api_key", "aliyun_access_key_secret"):
+        for key in ("ai_api_key", "asr_api_key", "aliyun_access_key_secret", "tts_api_key"):
             values[key] = _mask_secret(values.get(key, ""))
         values["aliyun_access_key_id"] = _mask_secret(values.get("aliyun_access_key_id", ""))
     return values
@@ -245,7 +329,7 @@ def create_project(name: str, custom_prompt: str = "", category: str = "默认")
 
 
 def update_project(project_id: int, **values: Any) -> dict[str, Any] | None:
-    allowed = {"name", "category", "custom_prompt", "status"}
+    allowed = {"name", "category", "custom_prompt", "custom_tags", "status"}
     clean = {key: value for key, value in values.items() if key in allowed}
     if clean:
         clean["updated_at"] = "CURRENT_TIMESTAMP"
@@ -347,9 +431,10 @@ def add_video(project_id: int, data: dict[str, Any]) -> dict[str, Any]:
             """
             INSERT INTO videos (
                 project_id, name, local_path, content_hash, thumbnail_path,
-                duration_seconds, width, height, fps, status
+                duration_seconds, width, height, fps, asset_type, source_mode,
+                has_voice, has_bgm, has_captions, keep_original_audio, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_id,
@@ -361,6 +446,12 @@ def add_video(project_id: int, data: dict[str, Any]) -> dict[str, Any]:
                 data.get("width", 0),
                 data.get("height", 0),
                 data.get("fps", 0),
+                data.get("asset_type", "finished_video"),
+                data.get("source_mode", "finished_mix"),
+                1 if data.get("has_voice", True) else 0,
+                1 if data.get("has_bgm", False) else 0,
+                1 if data.get("has_captions", False) else 0,
+                1 if data.get("keep_original_audio", True) else 0,
                 data.get("status", "imported"),
             ),
         )
@@ -414,9 +505,9 @@ def replace_video_segments(video_id: int, segments: list[dict[str, Any]]) -> lis
                 INSERT INTO segments (
                     project_id, video_id, segment_index, start_seconds, end_seconds,
                     text, semantic_type, position_type,
-                    visual_description, thumbnail_path
+                    visual_description, source_mode, keep_original_audio, thumbnail_path
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -428,6 +519,8 @@ def replace_video_segments(video_id: int, segments: list[dict[str, Any]]) -> lis
                     segment.get("semantic_type", "过渡"),
                     segment.get("position_type", "中间"),
                     segment.get("visual_description", ""),
+                    segment.get("source_mode", video.get("source_mode", "finished_mix")),
+                    int(segment.get("keep_original_audio", video.get("keep_original_audio", 1))),
                     segment.get("thumbnail_path", ""),
                 ),
             )
@@ -461,6 +554,7 @@ def list_segments(
                 s.id, s.project_id, s.video_id, s.segment_index,
                 s.start_seconds, s.end_seconds, s.text,
                 s.semantic_type, s.position_type, s.visual_description,
+                s.selling_points, s.visual_tags, s.source_mode, s.keep_original_audio,
                 s.thumbnail_path, s.created_at,
                 v.name AS video_name, v.local_path AS video_path,
                 p.name AS project_name
@@ -484,6 +578,7 @@ def get_segment(segment_id: int) -> dict[str, Any] | None:
                 s.id, s.project_id, s.video_id, s.segment_index,
                 s.start_seconds, s.end_seconds, s.text,
                 s.semantic_type, s.position_type, s.visual_description,
+                s.selling_points, s.visual_tags, s.source_mode, s.keep_original_audio,
                 s.thumbnail_path, s.created_at,
                 v.name AS video_name, v.local_path AS video_path,
                 p.name AS project_name
@@ -509,6 +604,7 @@ def get_segments_by_ids(segment_ids: list[int]) -> list[dict[str, Any]]:
                 s.id, s.project_id, s.video_id, s.segment_index,
                 s.start_seconds, s.end_seconds, s.text,
                 s.semantic_type, s.position_type, s.visual_description,
+                s.selling_points, s.visual_tags, s.source_mode, s.keep_original_audio,
                 s.thumbnail_path, s.created_at,
                 v.name AS video_name, v.local_path AS video_path,
                 p.name AS project_name
@@ -531,6 +627,11 @@ def update_segment(segment_id: int, **values: Any) -> dict[str, Any] | None:
         "semantic_type",
         "position_type",
         "visual_description",
+        "selling_points",
+        "visual_tags",
+        "source_mode",
+        "keep_original_audio",
+        "thumbnail_path",
     }
     clean = {key: value for key, value in values.items() if key in allowed}
     if clean:
@@ -689,6 +790,13 @@ def update_material_mix_timeline(
     *,
     name: str | None = None,
     is_favorite: bool | None = None,
+    voice_asset_id: int | None = None,
+    bgm_asset_id: int | None = None,
+    subtitle_preset_id: int | None = None,
+    audio_policy: str | None = None,
+    normalize_loudness: bool | None = None,
+    target_lufs: float | None = None,
+    burn_subtitles: bool | None = None,
 ) -> dict[str, Any] | None:
     init_workspace_db()
     values: dict[str, Any] = {}
@@ -699,6 +807,20 @@ def update_material_mix_timeline(
         values["name"] = clean_name
     if is_favorite is not None:
         values["is_favorite"] = 1 if is_favorite else 0
+    if voice_asset_id is not None:
+        values["voice_asset_id"] = voice_asset_id
+    if bgm_asset_id is not None:
+        values["bgm_asset_id"] = bgm_asset_id
+    if subtitle_preset_id is not None:
+        values["subtitle_preset_id"] = subtitle_preset_id
+    if audio_policy is not None:
+        values["audio_policy"] = audio_policy
+    if normalize_loudness is not None:
+        values["normalize_loudness"] = 1 if normalize_loudness else 0
+    if target_lufs is not None:
+        values["target_lufs"] = target_lufs
+    if burn_subtitles is not None:
+        values["burn_subtitles"] = 1 if burn_subtitles else 0
     if not values:
         return get_material_mix_timeline(timeline_id)
     with get_connection() as connection:
@@ -729,9 +851,9 @@ def duplicate_material_mix_timeline(timeline_id: int) -> dict[str, Any] | None:
             connection.execute(
                 """
                 INSERT INTO material_mix_clips (
-                    timeline_id, segment_id, source_path, source_in, source_out, track_type, position
+                    timeline_id, segment_id, source_path, source_in, source_out, track_type, position, selection_note
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     new_timeline_id,
@@ -741,6 +863,7 @@ def duplicate_material_mix_timeline(timeline_id: int) -> dict[str, Any] | None:
                     float(clip["source_out"]),
                     str(clip.get("track_type") or "video"),
                     int(clip["position"]),
+                    str(clip.get("selection_note") or ""),
                 ),
             )
     touch_project(int(source["project_id"]))
@@ -773,7 +896,9 @@ def get_material_mix_timeline(timeline_id: int) -> dict[str, Any] | None:
             SELECT
                 c.id AS clip_id, c.timeline_id, c.segment_id, c.source_path,
                 c.source_in, c.source_out, c.track_type, c.position,
+                c.selection_note,
                 s.text, s.semantic_type, s.position_type,
+                s.selling_points, s.visual_tags, s.visual_description,
                 v.name AS video_name
             FROM material_mix_clips c
             JOIN segments s ON s.id = c.segment_id
@@ -797,10 +922,16 @@ def get_material_mix_timeline(timeline_id: int) -> dict[str, Any] | None:
     result["clips"] = clips
     result["duration_seconds"] = round(cursor, 3)
     result["clip_count"] = len(clips)
+    if result.get("voice_asset_id"):
+        result["voice_asset"] = get_asset(int(result["voice_asset_id"]))
+    if result.get("bgm_asset_id"):
+        result["bgm_asset"] = get_asset(int(result["bgm_asset_id"]))
+    if result.get("subtitle_preset_id"):
+        result["subtitle_preset"] = get_asset(int(result["subtitle_preset_id"]))
     return result
 
 
-def add_material_mix_clip(timeline_id: int, segment_id: int) -> dict[str, Any] | None:
+def add_material_mix_clip(timeline_id: int, segment_id: int, selection_note: str = "") -> dict[str, Any] | None:
     timeline = get_material_mix_timeline(timeline_id)
     segment = get_segment(segment_id)
     if not timeline or not segment:
@@ -816,9 +947,9 @@ def add_material_mix_clip(timeline_id: int, segment_id: int) -> dict[str, Any] |
         connection.execute(
             """
             INSERT INTO material_mix_clips (
-                timeline_id, segment_id, source_path, source_in, source_out, track_type, position
+                timeline_id, segment_id, source_path, source_in, source_out, track_type, position, selection_note
             )
-            VALUES (?, ?, ?, ?, ?, 'video', ?)
+            VALUES (?, ?, ?, ?, ?, 'video', ?, ?)
             """,
             (
                 timeline_id,
@@ -827,6 +958,7 @@ def add_material_mix_clip(timeline_id: int, segment_id: int) -> dict[str, Any] |
                 float(segment["start_seconds"]),
                 float(segment["end_seconds"]),
                 position,
+                selection_note,
             ),
         )
         connection.execute(
@@ -844,6 +976,7 @@ def update_material_mix_clip(
     segment_id: int | None = None,
     source_in: float | None = None,
     source_out: float | None = None,
+    selection_note: str | None = None,
     action: str | None = None,
 ) -> dict[str, Any] | None:
     with get_connection() as connection:
@@ -874,6 +1007,8 @@ def update_material_mix_clip(
                 values["source_path"] = str(segment["video_path"])
                 values["source_in"] = float(segment["start_seconds"])
                 values["source_out"] = float(segment["end_seconds"])
+            if selection_note is not None:
+                values["selection_note"] = selection_note
             if source_in is not None:
                 values["source_in"] = source_in
             if source_out is not None:
@@ -929,6 +1064,252 @@ def _renumber_material_mix_clips(connection: sqlite3.Connection, timeline_id: in
     ).fetchall()
     for index, row in enumerate(rows, start=1):
         connection.execute("UPDATE material_mix_clips SET position = ? WHERE id = ?", (index, int(row["id"])))
+
+
+def add_asset(
+    *,
+    project_id: int | None,
+    asset_type: str,
+    name: str,
+    file_path: Path,
+    source_path: Path | None = None,
+    tags: str = "",
+    metadata: dict[str, Any] | None = None,
+    duration_seconds: float = 0,
+    status: str = "ready",
+) -> dict[str, Any]:
+    init_workspace_db()
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO assets (
+                project_id, asset_type, name, file_path, source_path, tags,
+                metadata, duration_seconds, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                asset_type,
+                name.strip() or asset_type,
+                str(file_path),
+                str(source_path or file_path),
+                tags,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                duration_seconds,
+                status,
+            ),
+        )
+        asset_id = int(cursor.lastrowid)
+    if project_id:
+        touch_project(project_id)
+    return get_asset(asset_id) or {}
+
+
+def get_asset(asset_id: int) -> dict[str, Any] | None:
+    init_workspace_db()
+    with get_connection() as connection:
+        row = connection.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
+    if not row:
+        return None
+    asset = dict(row)
+    try:
+        asset["metadata"] = json.loads(str(asset.get("metadata") or "{}"))
+    except json.JSONDecodeError:
+        asset["metadata"] = {}
+    return asset
+
+
+def list_assets(project_id: int | None = None, asset_type: str = "") -> list[dict[str, Any]]:
+    init_workspace_db()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if project_id is not None:
+        clauses.append("(project_id = ? OR project_id IS NULL)")
+        params.append(project_id)
+    if asset_type:
+        clauses.append("asset_type = ?")
+        params.append(asset_type)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_connection() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM assets {where} ORDER BY created_at DESC, id DESC",
+            tuple(params),
+        ).fetchall()
+    assets = [dict(row) for row in rows]
+    for asset in assets:
+        try:
+            asset["metadata"] = json.loads(str(asset.get("metadata") or "{}"))
+        except json.JSONDecodeError:
+            asset["metadata"] = {}
+    return assets
+
+
+def update_asset(asset_id: int, **values: Any) -> dict[str, Any] | None:
+    allowed = {"name", "tags", "metadata", "status", "duration_seconds"}
+    clean = {key: value for key, value in values.items() if key in allowed}
+    if "metadata" in clean and not isinstance(clean["metadata"], str):
+        clean["metadata"] = json.dumps(clean["metadata"], ensure_ascii=False)
+    if clean:
+        assignments = ", ".join(f"{key} = ?" for key in clean)
+        params = list(clean.values())
+        params.append(asset_id)
+        with get_connection() as connection:
+            connection.execute(f"UPDATE assets SET {assignments} WHERE id = ?", tuple(params))
+    return get_asset(asset_id)
+
+
+def add_script(
+    *,
+    project_id: int,
+    title: str,
+    source_type: str,
+    source_text: str,
+    product_context: str,
+    lines: list[dict[str, Any]],
+) -> dict[str, Any]:
+    init_workspace_db()
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO scripts (
+                project_id, title, source_type, source_text, product_context, lines
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                title.strip() or "AI 文案",
+                source_type,
+                source_text,
+                product_context,
+                json.dumps(lines, ensure_ascii=False),
+            ),
+        )
+        script_id = int(cursor.lastrowid)
+    touch_project(project_id)
+    return get_script(script_id) or {}
+
+
+def get_script(script_id: int) -> dict[str, Any] | None:
+    init_workspace_db()
+    with get_connection() as connection:
+        row = connection.execute("SELECT * FROM scripts WHERE id = ?", (script_id,)).fetchone()
+    if not row:
+        return None
+    script = dict(row)
+    try:
+        script["lines"] = json.loads(str(script.get("lines") or "[]"))
+    except json.JSONDecodeError:
+        script["lines"] = []
+    return script
+
+
+def list_scripts(project_id: int) -> list[dict[str, Any]]:
+    init_workspace_db()
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM scripts WHERE project_id = ? ORDER BY created_at DESC, id DESC",
+            (project_id,),
+        ).fetchall()
+    scripts = [dict(row) for row in rows]
+    for script in scripts:
+        try:
+            script["lines"] = json.loads(str(script.get("lines") or "[]"))
+        except json.JSONDecodeError:
+            script["lines"] = []
+    return scripts
+
+
+def update_script(script_id: int, **values: Any) -> dict[str, Any] | None:
+    allowed = {"title", "source_text", "product_context", "lines"}
+    clean = {key: value for key, value in values.items() if key in allowed}
+    if "lines" in clean and not isinstance(clean["lines"], str):
+        clean["lines"] = json.dumps(clean["lines"], ensure_ascii=False)
+    if clean:
+        assignments = ", ".join(f"{key} = ?" for key in clean)
+        params = list(clean.values())
+        params.append(script_id)
+        with get_connection() as connection:
+            connection.execute(f"UPDATE scripts SET {assignments} WHERE id = ?", tuple(params))
+    script = get_script(script_id)
+    if script:
+        touch_project(int(script["project_id"]))
+    return script
+
+
+def create_ai_task(
+    *,
+    project_id: int | None,
+    task_type: str,
+    target_type: str,
+    target_id: int,
+    status: str = "queued",
+    message: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    init_workspace_db()
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO ai_tasks (
+                project_id, task_type, target_type, target_id, status, message, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                task_type,
+                target_type,
+                target_id,
+                status,
+                message,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+        task_id = int(cursor.lastrowid)
+    if project_id:
+        touch_project(project_id)
+    return get_ai_task(task_id) or {}
+
+
+def get_ai_task(task_id: int) -> dict[str, Any] | None:
+    init_workspace_db()
+    with get_connection() as connection:
+        row = connection.execute("SELECT * FROM ai_tasks WHERE id = ?", (task_id,)).fetchone()
+    if not row:
+        return None
+    task = dict(row)
+    try:
+        task["metadata"] = json.loads(str(task.get("metadata") or "{}"))
+    except json.JSONDecodeError:
+        task["metadata"] = {}
+    return task
+
+
+def list_ai_tasks(project_id: int | None = None, task_type: str = "") -> list[dict[str, Any]]:
+    init_workspace_db()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if project_id is not None:
+        clauses.append("project_id = ?")
+        params.append(project_id)
+    if task_type:
+        clauses.append("task_type = ?")
+        params.append(task_type)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_connection() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM ai_tasks {where} ORDER BY updated_at DESC, id DESC",
+            tuple(params),
+        ).fetchall()
+    tasks = [dict(row) for row in rows]
+    for task in tasks:
+        try:
+            task["metadata"] = json.loads(str(task.get("metadata") or "{}"))
+        except json.JSONDecodeError:
+            task["metadata"] = {}
+    return tasks
 
 
 def create_scheme_set(project_id: int, schemes: list[dict[str, Any]]) -> list[dict[str, Any]]:
