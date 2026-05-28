@@ -22,7 +22,6 @@ from app.services.material_store import (
 )
 from app.services.workspace_store import (
     add_asset,
-    create_ai_task,
     add_video,
     add_script,
     create_project,
@@ -30,6 +29,7 @@ from app.services.workspace_store import (
     delete_material_mix_timeline,
     delete_project,
     delete_segments,
+    delete_videos,
     delete_scheme_segment,
     duplicate_material_mix_timeline,
     get_project,
@@ -76,11 +76,14 @@ from app.services.providers import (
     segment_transcript,
     test_ai_settings,
     test_asr_settings,
+    test_vision_settings,
     transcribe_video_with_segments,
 )
 from app.services.video_processor import (
     VideoProcessingError,
+    _ffmpeg_filter_available,
     analyze_audio_loudness,
+    clean_ffmpeg_error,
     create_preview_clip,
     create_segment_range_preview,
     create_segment_preview,
@@ -214,7 +217,7 @@ class AppSettingsRequest(BaseModel):
 
 
 class SettingsTestRequest(BaseModel):
-    target: str = Field(pattern="^(ai|asr|tts)$")
+    target: str = Field(pattern="^(ai|vision|asr|tts)$")
 
 
 class ProjectCreateRequest(BaseModel):
@@ -272,6 +275,10 @@ class SegmentExportRequest(BaseModel):
 
 class SegmentDeleteRequest(BaseModel):
     segment_ids: list[int] = Field(min_length=1)
+
+
+class VideoDeleteRequest(BaseModel):
+    video_ids: list[int] = Field(min_length=1)
 
 
 class SegmentSplitRequest(BaseModel):
@@ -550,6 +557,8 @@ async def test_settings(payload: SettingsTestRequest) -> dict[str, str]:
     try:
         if payload.target == "ai":
             return await test_ai_settings()
+        if payload.target == "vision":
+            return await test_vision_settings()
         if payload.target == "tts":
             return test_tts_settings()
         return await test_asr_settings()
@@ -680,9 +689,9 @@ async def _process_video_pipeline(video_id: int) -> None:
         workspace_store.replace_video_segments(video_id, segments)
         workspace_store.update_video(video_id, status="segmented", error_message="")
     except ProviderError as exc:
-        workspace_store.update_video(video_id, status="failed", error_message=str(exc))
+        workspace_store.update_video(video_id, status="failed", error_message=clean_ffmpeg_error(str(exc)))
     except Exception as exc:  # noqa: BLE001
-        workspace_store.update_video(video_id, status="failed", error_message=str(exc))
+        workspace_store.update_video(video_id, status="failed", error_message=clean_ffmpeg_error(str(exc)))
 
 
 @router.post("/projects/{project_id}/videos/import")
@@ -893,6 +902,16 @@ def read_project_videos(project_id: int) -> list[dict[str, object]]:
     return list_videos(project_id)
 
 
+@router.delete("/videos")
+def remove_selected_videos(payload: VideoDeleteRequest) -> dict[str, object]:
+    videos = [get_video(video_id) for video_id in payload.video_ids]
+    missing = [video_id for video_id, video in zip(payload.video_ids, videos) if video is None]
+    if missing:
+        raise HTTPException(status_code=404, detail="Some selected videos were not found.")
+    removed_count = delete_videos(payload.video_ids)
+    return {"removed_count": removed_count, "video_ids": payload.video_ids}
+
+
 @router.post("/videos/{video_id}/reanalyze")
 def reanalyze_project_video(video_id: int, background_tasks: BackgroundTasks) -> dict[str, object]:
     video = get_video(video_id)
@@ -911,8 +930,9 @@ async def transcribe_project_video(video_id: int, payload: ManualTranscribeReque
     try:
         transcription = await transcribe_video_with_segments(Path(str(video["local_path"])), payload.manual_transcript)
     except ProviderError as exc:
-        workspace_store.update_video(video_id, status="transcribe_failed", error_message=str(exc))
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        detail = clean_ffmpeg_error(str(exc))
+        workspace_store.update_video(video_id, status="transcribe_failed", error_message=detail)
+        raise HTTPException(status_code=400, detail=detail) from exc
     return workspace_store.update_video(
         video_id,
         transcript=str(transcription["text"]),
@@ -940,8 +960,9 @@ async def segment_project_video(video_id: int) -> list[dict[str, object]]:
         workspace_store.update_video(video_id, status="segmented", error_message="")
         return saved
     except ProviderError as exc:
-        workspace_store.update_video(video_id, status="segment_failed", error_message=str(exc))
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        detail = clean_ffmpeg_error(str(exc))
+        workspace_store.update_video(video_id, status="segment_failed", error_message=detail)
+        raise HTTPException(status_code=400, detail=detail) from exc
 
 
 @router.get("/projects/{project_id}/segments")
@@ -1005,11 +1026,11 @@ def patch_segment(segment_id: int, payload: SegmentPatchRequest) -> dict[str, ob
         raise HTTPException(status_code=404, detail="Segment not found.")
     values = payload.model_dump(exclude_unset=True)
     if "semantic_type" in values:
-        invalid_tags = _split_multi_value(values["semantic_type"]) - ALLOWED_TAGS
+        invalid_tags = set(_split_multi_value(values["semantic_type"])) - ALLOWED_TAGS
         if invalid_tags:
             raise HTTPException(status_code=400, detail="Invalid semantic type.")
     if "position_type" in values:
-        invalid_positions = _split_multi_value(values["position_type"]) - {"开头", "中间", "结尾"}
+        invalid_positions = set(_split_multi_value(values["position_type"])) - {"开头", "中间", "结尾"}
         if invalid_positions:
             raise HTTPException(status_code=400, detail="Invalid position type.")
     start = float(values.get("start_seconds", segment["start_seconds"]))
@@ -1405,10 +1426,15 @@ def export_material_mix_timeline(timeline_id: int, payload: MaterialMixExportReq
         export_path = export_timeline(timeline, output_dir=output_dir)
     except VideoProcessingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    requested_burn_subtitles = bool(payload.burn_subtitles) if payload else bool(int(timeline.get("burn_subtitles") or 0))
+    warnings = []
+    if requested_burn_subtitles and not _ffmpeg_filter_available("subtitles"):
+        warnings.append("当前 FFmpeg 没有 subtitles 滤镜，已跳过字幕烧录；请安装支持 libass 的 FFmpeg 后重试字幕内嵌导出。")
     return {
         "export_path": str(export_path),
         "timeline_id": timeline_id,
         "clip_ids": [int(item["clip_id"]) for item in timeline["clips"]],
+        "warnings": warnings,
     }
 
 
@@ -1673,33 +1699,12 @@ def generate_timeline_from_voice(payload: VoiceTimelineRequest) -> dict[str, obj
 
 @router.post("/audio/remove-bgm")
 def remove_bgm(payload: RemoveBgmRequest) -> dict[str, object]:
-    target: dict[str, object] | None = None
-    target_type = "asset"
-    project_id: int | None = None
-    if payload.asset_id:
-        target = get_asset(payload.asset_id)
-        project_id = int(target["project_id"]) if target and target.get("project_id") else None
-    if payload.video_id:
-        target = get_video(payload.video_id)
-        target_type = "video"
-        project_id = int(target["project_id"]) if target and target.get("project_id") else None
-    if not target:
-        raise HTTPException(status_code=404, detail="没有找到要处理的素材。")
-    task = create_ai_task(
-        project_id=project_id,
-        task_type="remove_bgm",
-        target_type=target_type,
-        target_id=int(payload.video_id or payload.asset_id or 0),
-        status="waiting_worker",
-        message="等待可选 AI Worker（Demucs/UVR）启用后处理。",
-        metadata={"target_name": target.get("name") or target.get("source_name") or target.get("local_path") or ""},
+    if not payload.asset_id and not payload.video_id:
+        raise HTTPException(status_code=400, detail="请提供要处理的素材或成片。")
+    raise HTTPException(
+        status_code=501,
+        detail="去 BGM 能力未启用：当前版本没有本地 AI Worker，无法创建人声/BGM 分离任务。",
     )
-    return {
-        "status": "waiting_worker",
-        "message": "已创建去 BGM 任务；启用可选 AI Worker 后会处理人声/BGM 分离。",
-        "task": task,
-        "target": target,
-    }
 
 
 @router.get("/materials", response_model=list[Material])
@@ -1913,10 +1918,6 @@ def _find_matching_material(
     return None
 
 
-def _split_multi_value(value: str) -> set[str]:
-    return {item.strip() for item in value.split(",") if item.strip()}
-
-
 def _validate_mix_requirements(items: list[dict[str, str]]) -> list[MixRequirement]:
     requirements: list[MixRequirement] = []
     for item in items:
@@ -1971,6 +1972,7 @@ async def _generate_tts_audio(payload: TtsGenerateRequest) -> tuple[Path, dict[s
     result = subprocess.run(
         [
             "ffmpeg",
+            "-hide_banner",
             "-y",
             "-f",
             "lavfi",
@@ -1987,7 +1989,7 @@ async def _generate_tts_audio(payload: TtsGenerateRequest) -> tuple[Path, dict[s
         check=False,
     )
     if result.returncode != 0:
-        raise ProviderError(result.stderr.strip() or "生成占位配音失败。")
+        raise ProviderError(clean_ffmpeg_error(result.stderr.strip() or "生成占位配音失败。"))
     return output_path, {
         "provider": "placeholder",
         "duration_seconds": duration,

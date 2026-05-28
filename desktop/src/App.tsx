@@ -1,4 +1,4 @@
-import { type ChangeEvent, type KeyboardEvent, type RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type ClipboardEvent, type KeyboardEvent, type RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -8,6 +8,7 @@ const POSITION_TYPES = ["开头", "中间", "结尾"];
 const SIDEBAR_CATEGORY_LIMIT = 4;
 const SCHEME_PREVIEW_START_GUARD_SECONDS = 0.06;
 const SCHEME_PREVIEW_END_GUARD_SECONDS = 0.02;
+const REMOVE_BGM_ENABLED = false;
 
 type WorkspaceView = "workspace" | "overview" | "import" | "assets" | "scripts" | "voice" | "materialMix" | "schemes" | "subtitles" | "settings";
 
@@ -207,11 +208,40 @@ declare global {
   }
 }
 
+function formatProcessingError(message: string) {
+  const lines = (message || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return "处理失败，请稍后重试。";
+  const noisePrefixes = [
+    "ffmpeg version",
+    "ffprobe version",
+    "built with",
+    "configuration:",
+    "libavutil",
+    "libavcodec",
+    "libavformat",
+    "libavdevice",
+    "libavfilter",
+    "libswscale",
+    "libswresample",
+    "libpostproc",
+  ];
+  const meaningful = lines.filter((line) => !noisePrefixes.some((prefix) => line.toLowerCase().startsWith(prefix)));
+  const candidates = meaningful.length > 0 ? meaningful : lines;
+  const markers = ["error", "invalid", "failed", "not found", "no such", "could not", "unsupported", "moov atom"];
+  const important = candidates.filter((line) => markers.some((marker) => line.toLowerCase().includes(marker)));
+  return (important.length > 0 ? important.slice(-3) : candidates.slice(-3)).join("；").slice(0, 500);
+}
+
+function apiErrorDetail(data: { detail?: unknown }, fallback: string) {
+  if (typeof data.detail === "string") return formatProcessingError(data.detail);
+  return fallback;
+}
+
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.detail ?? "请求失败");
+    throw new Error(apiErrorDetail(data, "请求失败"));
   }
   return data as T;
 }
@@ -776,7 +806,7 @@ function ImportAnalyze(props: {
   project: Project;
   videos: VideoItem[];
   segments: Segment[];
-  onRefresh: () => void;
+  onRefresh: () => void | Promise<void>;
   setMessage: (value: string) => void;
   setError: (value: string) => void;
 }) {
@@ -785,18 +815,82 @@ function ImportAnalyze(props: {
   const [customTagDraft, setCustomTagDraft] = useState(props.project.custom_tags ?? "");
   const [showBgmDialog, setShowBgmDialog] = useState(false);
   const [selectedBgmVideoIds, setSelectedBgmVideoIds] = useState<number[]>([]);
+  const [selectedFinishedVideoIds, setSelectedFinishedVideoIds] = useState<number[]>([]);
+  const [selectedLooseVideoIds, setSelectedLooseVideoIds] = useState<number[]>([]);
+  const [deleteBusy, setDeleteBusy] = useState<"finished" | "loose" | null>(null);
+  const [locallyRemovedVideoIds, setLocallyRemovedVideoIds] = useState<number[]>([]);
+  const [finishedViewMode, setFinishedViewMode] = useState<"grid" | "list">("grid");
+  const [looseViewMode, setLooseViewMode] = useState<"grid" | "list">("grid");
   const [importing, setImporting] = useState(false);
   const [assetImporting, setAssetImporting] = useState(false);
   const [batchTaggingBusy, setBatchTaggingBusy] = useState(false);
   const [finishedBatchBusy, setFinishedBatchBusy] = useState(false);
   const [taggingSegmentId, setTaggingSegmentId] = useState<number | null>(null);
   const [reanalyzingId, setReanalyzingId] = useState<number | null>(null);
-  const productSegments = props.segments.filter((segment) => segment.source_mode === "product_assets" || !segment.text);
-  const finishedVideos = props.videos.filter((video) => video.asset_type === "finished_video" || !video.asset_type);
+  const [removeBgmTasks, setRemoveBgmTasks] = useState<AiTask[]>([]);
+  const [visualErrors, setVisualErrors] = useState<Record<number, string>>({});
+  const locallyRemovedVideoIdSet = new Set(locallyRemovedVideoIds);
+  const productSegments = props.segments.filter((segment) => (
+    (segment.source_mode === "product_assets" || !segment.text)
+    && !locallyRemovedVideoIdSet.has(segment.video_id)
+  ));
+  const finishedVideos = props.videos.filter((video) => (
+    (video.asset_type === "finished_video" || !video.asset_type)
+    && !locallyRemovedVideoIdSet.has(video.id)
+  ));
+  const recentRemoveBgmTasks = removeBgmTasks.slice(0, 4);
+  const activeRemoveBgmVideoIds = new Set(
+    removeBgmTasks
+      .filter((task) => task.target_type === "video" && !["completed", "failed"].includes(task.status))
+      .map((task) => Number(task.target_id)),
+  );
+  const selectableBgmVideoIds = finishedVideos.filter((video) => !activeRemoveBgmVideoIds.has(video.id)).map((video) => video.id);
+  const customTagCount = splitMultiValue(customTagDraft).length;
+  const customTagsDirty = customTagDraft.trim() !== String(props.project.custom_tags ?? "").trim();
+  const finishedDoneCount = finishedVideos.filter((video) => video.status === "segmented").length;
+  const finishedRunningCount = finishedVideos.filter((video) => ["transcribing", "segmenting", "imported", "transcribed"].includes(video.status)).length;
+  const activeRemoveBgmCount = activeRemoveBgmVideoIds.size;
+  const productAnalyzedCount = productSegments.filter((segment) => segment.visual_description || segment.selling_points || segment.visual_tags).length;
+  const productPendingCount = Math.max(0, productSegments.length - productAnalyzedCount);
 
   useEffect(() => {
     setCustomTagDraft(props.project.custom_tags ?? "");
   }, [props.project.id, props.project.custom_tags]);
+
+  useEffect(() => {
+    const finishedIds = new Set(finishedVideos.map((video) => video.id));
+    const looseIds = new Set(productSegments.map((segment) => segment.video_id));
+    setSelectedFinishedVideoIds((current) => current.filter((videoId) => finishedIds.has(videoId)));
+    setSelectedLooseVideoIds((current) => current.filter((videoId) => looseIds.has(videoId)));
+  }, [props.project.id, props.videos, props.segments]);
+
+  useEffect(() => {
+    if (!REMOVE_BGM_ENABLED) {
+      setRemoveBgmTasks([]);
+      setSelectedBgmVideoIds([]);
+      return;
+    }
+    void loadRemoveBgmTasks();
+    const timer = window.setInterval(() => {
+      void loadRemoveBgmTasks();
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [props.project.id]);
+
+  async function loadRemoveBgmTasks() {
+    try {
+      const tasks = await api<AiTask[]>(`/projects/${props.project.id}/ai-tasks?task_type=remove_bgm`);
+      setRemoveBgmTasks(tasks);
+      const activeVideoIds = new Set(
+        tasks
+          .filter((task) => task.target_type === "video" && !["completed", "failed"].includes(task.status))
+          .map((task) => Number(task.target_id)),
+      );
+      setSelectedBgmVideoIds((current) => current.filter((videoId) => !activeVideoIds.has(videoId)));
+    } catch {
+      setRemoveBgmTasks([]);
+    }
+  }
 
   async function uploadVideo(selectedFiles: File[]) {
     if (selectedFiles.length === 0) {
@@ -808,7 +902,7 @@ function ImportAnalyze(props: {
     setImporting(true);
     try {
       const imported = await fetch(`${API_BASE_URL}/projects/${props.project.id}/videos/import`, { method: "POST", body: formData }).then(async (response) => {
-        if (!response.ok) throw new Error((await response.json()).detail ?? "导入失败");
+        if (!response.ok) throw new Error(apiErrorDetail(await response.json().catch(() => ({})), "导入失败"));
         return response.json() as Promise<VideoItem[]>;
       });
       props.setMessage(`已导入 ${selectedFiles.length} 个成片，后台正在自动转录和切分。`);
@@ -862,6 +956,58 @@ function ImportAnalyze(props: {
     }
   }
 
+  function toggleFinishedVideoSelection(videoId: number) {
+    setSelectedFinishedVideoIds((current) => (
+      current.includes(videoId) ? current.filter((id) => id !== videoId) : [...current, videoId]
+    ));
+  }
+
+  function toggleLooseVideoSelection(videoId: number) {
+    setSelectedLooseVideoIds((current) => (
+      current.includes(videoId) ? current.filter((id) => id !== videoId) : [...current, videoId]
+    ));
+  }
+
+  function toggleAllFinishedVideos() {
+    setSelectedFinishedVideoIds((current) => current.length === finishedVideos.length ? [] : finishedVideos.map((video) => video.id));
+  }
+
+  function toggleAllLooseVideos() {
+    const ids = Array.from(new Set(productSegments.map((segment) => segment.video_id)));
+    setSelectedLooseVideoIds((current) => current.length === ids.length ? [] : ids);
+  }
+
+  async function deleteSelectedVideos(kind: "finished" | "loose") {
+    const selectedIds = kind === "finished" ? selectedFinishedVideoIds : selectedLooseVideoIds;
+    if (selectedIds.length === 0) {
+      props.setError(kind === "finished" ? "请先选择要删除的成片素材。" : "请先选择要删除的零散素材。");
+      return;
+    }
+    const label = kind === "finished" ? "成片素材" : "零散素材";
+    if (!window.confirm(`确定删除选中的 ${selectedIds.length} 个${label}吗？对应分析片段也会一起删除。`)) return;
+    setDeleteBusy(kind);
+    setLocallyRemovedVideoIds((current) => Array.from(new Set([...current, ...selectedIds])));
+    try {
+      const result = await api<{ removed_count: number }>("/videos", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ video_ids: selectedIds }),
+      });
+      if (kind === "finished") {
+        setSelectedFinishedVideoIds([]);
+      } else {
+        setSelectedLooseVideoIds([]);
+      }
+      props.setMessage(`已删除 ${result.removed_count} 个${label}。`);
+      await props.onRefresh();
+    } catch (err) {
+      setLocallyRemovedVideoIds((current) => current.filter((videoId) => !selectedIds.includes(videoId)));
+      props.setError(err instanceof Error ? err.message : `${label}删除失败`);
+    } finally {
+      setDeleteBusy(null);
+    }
+  }
+
   async function uploadLooseAssets(selectedFiles: File[]) {
     if (selectedFiles.length === 0) {
       props.setError("请先选择零散素材文件。");
@@ -872,17 +1018,36 @@ function ImportAnalyze(props: {
     setAssetImporting(true);
     try {
       await fetch(`${API_BASE_URL}/projects/${props.project.id}/assets/import?asset_type=product_shot`, { method: "POST", body: formData }).then(async (response) => {
-        if (!response.ok) throw new Error((await response.json()).detail ?? "导入失败");
+        if (!response.ok) throw new Error(apiErrorDetail(await response.json().catch(() => ({})), "导入失败"));
       });
       if (customTagDraft.trim() !== (props.project.custom_tags ?? "").trim()) {
         await saveCustomTags(false);
       }
-      const result = await api<{ analyzed_count: number; error_count: number }>("/projects/" + props.project.id + "/segments/analyze-visual", {
+      const result = await api<{ analyzed_count: number; error_count: number; analyzed?: Array<{ segment?: Segment }>; errors?: Array<{ segment_id: number; error: string }> }>("/projects/" + props.project.id + "/segments/analyze-visual", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ limit: Math.max(20, selectedFiles.length), only_missing: true }),
       });
-      props.setMessage(`零散素材已导入并自动分析 ${result.analyzed_count} 个镜头${result.error_count ? `，${result.error_count} 个失败` : ""}。`);
+      props.setMessage(`零散素材已导入，AI 已按你的 tag 词库识别 ${result.analyzed_count} 个镜头${result.error_count ? `，${result.error_count} 个失败` : ""}。`);
+      if (result.analyzed?.length) {
+        setVisualErrors((current) => {
+          const next = { ...current };
+          result.analyzed?.forEach((item) => {
+            if (item.segment?.id) delete next[item.segment.id];
+          });
+          return next;
+        });
+      }
+      if (result.error_count) {
+        props.setError(`有 ${result.error_count} 个镜头暂未完成 AI 打标：${formatProcessingError(result.errors?.[0]?.error || "可稍后重新批量分析")}`);
+        setVisualErrors((current) => ({
+          ...current,
+          ...(result.errors || []).reduce<Record<number, string>>((errors, item) => {
+            errors[item.segment_id] = formatProcessingError(item.error);
+            return errors;
+          }, {}),
+        }));
+      }
       props.onRefresh();
     } catch (err) {
       props.setError(err instanceof Error ? err.message : "零散素材导入失败");
@@ -894,7 +1059,7 @@ function ImportAnalyze(props: {
   function openLooseFilePicker() {
     const hasTag = customTagDraft.trim().length > 0 || String(props.project.custom_tags ?? "").trim().length > 0;
     if (!hasTag) {
-      const shouldContinue = window.confirm("建议先录入产品卖点/画面 tag，AI 识别会更精准。仍然继续导入吗？");
+      const shouldContinue = window.confirm("建议先录入需要 AI 识别的 tag。零散素材分析会抽取静帧，并只从你录入的 tag 中选择匹配项。仍然继续导入吗？");
       if (!shouldContinue) return;
     }
     looseFileInputRef.current?.click();
@@ -910,12 +1075,22 @@ function ImportAnalyze(props: {
 
   async function analyzeVisual(segmentId: number) {
     setTaggingSegmentId(segmentId);
+    setVisualErrors((current) => {
+      const next = { ...current };
+      delete next[segmentId];
+      return next;
+    });
     try {
+      if (customTagsDirty) {
+        await saveCustomTags(false);
+      }
       await api(`/segments/${segmentId}/analyze-visual`, { method: "POST" });
-      props.setMessage("已生成产品镜头卖点 tag。");
+      props.setMessage("已按你的 tag 词库完成该镜头识别。");
       props.onRefresh();
     } catch (err) {
-      props.setError(err instanceof Error ? err.message : "视觉打标失败");
+      const message = err instanceof Error ? err.message : "视觉打标失败";
+      setVisualErrors((current) => ({ ...current, [segmentId]: formatProcessingError(message) }));
+      props.setError(message);
     } finally {
       setTaggingSegmentId(null);
     }
@@ -924,12 +1099,34 @@ function ImportAnalyze(props: {
   async function analyzeProductBatch() {
     setBatchTaggingBusy(true);
     try {
-      const result = await api<{ analyzed_count: number; error_count: number }>("/projects/" + props.project.id + "/segments/analyze-visual", {
+      if (customTagsDirty) {
+        await saveCustomTags(false);
+      }
+      const result = await api<{ analyzed_count: number; error_count: number; analyzed?: Array<{ segment?: Segment }>; errors?: Array<{ segment_id: number; error: string }> }>("/projects/" + props.project.id + "/segments/analyze-visual", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ limit: 20, only_missing: true }),
+        body: JSON.stringify({ limit: 100, only_missing: false }),
       });
-      props.setMessage(`已批量分析 ${result.analyzed_count} 个产品镜头${result.error_count ? `，${result.error_count} 个失败` : ""}。`);
+      props.setMessage(`已按你的 tag 词库批量识别 ${result.analyzed_count} 个镜头${result.error_count ? `，${result.error_count} 个失败` : ""}。`);
+      if (result.analyzed?.length) {
+        setVisualErrors((current) => {
+          const next = { ...current };
+          result.analyzed?.forEach((item) => {
+            if (item.segment?.id) delete next[item.segment.id];
+          });
+          return next;
+        });
+      }
+      if (result.error_count) {
+        props.setError(`有 ${result.error_count} 个镜头暂未完成 AI 打标：${formatProcessingError(result.errors?.[0]?.error || "可稍后重新批量分析")}`);
+        setVisualErrors((current) => ({
+          ...current,
+          ...(result.errors || []).reduce<Record<number, string>>((errors, item) => {
+            errors[item.segment_id] = formatProcessingError(item.error);
+            return errors;
+          }, {}),
+        }));
+      }
       props.onRefresh();
     } catch (err) {
       props.setError(err instanceof Error ? err.message : "批量视觉打标失败");
@@ -946,7 +1143,23 @@ function ImportAnalyze(props: {
         body: JSON.stringify({ custom_tags: customTagDraft }),
       });
       if (showMessage) {
-        props.setMessage("自定义 AI 打标 tag 已保存，后续 AI 打标会优先使用这些 tag。");
+        props.setMessage("零散素材识别 tag 已保存，AI 会只从这些 tag 中选择匹配项。");
+      }
+      props.onRefresh();
+    } catch (err) {
+      props.setError(err instanceof Error ? err.message : "自定义 tag 保存失败");
+    }
+  }
+
+  async function saveCustomTagsValue(value: string, showMessage = false) {
+    try {
+      await api<Project>(`/projects/${props.project.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ custom_tags: value }),
+      });
+      if (showMessage) {
+        props.setMessage("零散素材识别 tag 已保存，AI 会只从这些 tag 中选择匹配项。");
       }
       props.onRefresh();
     } catch (err) {
@@ -955,6 +1168,10 @@ function ImportAnalyze(props: {
   }
 
   async function requestRemoveBgm(videoId: number, showMessage = true) {
+    if (!REMOVE_BGM_ENABLED) {
+      props.setError("去 BGM 能力未启用：当前版本没有本地 AI Worker，暂不能处理人声/BGM 分离。");
+      return;
+    }
     try {
       const result = await api<{ message: string }>("/audio/remove-bgm", {
         method: "POST",
@@ -970,17 +1187,23 @@ function ImportAnalyze(props: {
   }
 
   function toggleBgmVideo(videoId: number) {
+    if (activeRemoveBgmVideoIds.has(videoId)) return;
     setSelectedBgmVideoIds((current) => (
       current.includes(videoId) ? current.filter((id) => id !== videoId) : [...current, videoId]
     ));
   }
 
   async function removeBgmForSelectedVideos() {
+    if (!REMOVE_BGM_ENABLED) {
+      props.setError("去 BGM 能力未启用：当前版本没有本地 AI Worker，暂不能处理人声/BGM 分离。");
+      return;
+    }
     if (selectedBgmVideoIds.length === 0) {
       props.setError("请先选择需要消除 BGM 的成片。");
       return;
     }
     await Promise.all(selectedBgmVideoIds.map((videoId) => requestRemoveBgm(videoId, false)));
+    await loadRemoveBgmTasks();
     props.setMessage(`已为 ${selectedBgmVideoIds.length} 个成片创建消除 BGM 任务。`);
     setSelectedBgmVideoIds([]);
     setShowBgmDialog(false);
@@ -994,9 +1217,28 @@ function ImportAnalyze(props: {
             <div>
               <h2>成片导入拆分</h2>
               <p>导入带口播成片，自动 ASR、语义切分、打大类 tag。</p>
+              <div className="mini-summary-strip">
+                <span>成片 {finishedVideos.length}</span>
+                <span>完成 {finishedDoneCount}</span>
+                <span>处理中 {finishedRunningCount}</span>
+                {REMOVE_BGM_ENABLED && <span>去 BGM {activeRemoveBgmCount}</span>}
+                {selectedFinishedVideoIds.length > 0 && <span>已选 {selectedFinishedVideoIds.length}</span>}
+              </div>
             </div>
             <div className="import-primary-actions">
-              <button className="secondary" disabled={finishedVideos.length === 0} onClick={() => setShowBgmDialog(true)}>消除 BGM</button>
+              <button className="secondary" disabled={finishedVideos.length === 0} onClick={toggleAllFinishedVideos}>
+                {selectedFinishedVideoIds.length === finishedVideos.length && finishedVideos.length > 0 ? "取消全选" : "全选"}
+              </button>
+              <button className="danger-action" disabled={deleteBusy === "finished" || selectedFinishedVideoIds.length === 0} onClick={() => deleteSelectedVideos("finished")}>
+                {deleteBusy === "finished" ? "删除中..." : "删除素材"}
+              </button>
+              <div className="view-toggle tiny-toggle">
+                <button className={finishedViewMode === "grid" ? "active" : ""} onClick={() => setFinishedViewMode("grid")}>网格</button>
+                <button className={finishedViewMode === "list" ? "active" : ""} onClick={() => setFinishedViewMode("list")}>列表</button>
+              </div>
+              {REMOVE_BGM_ENABLED && (
+                <button className="secondary" disabled={finishedVideos.length === 0} onClick={() => setShowBgmDialog(true)}>消除 BGM</button>
+              )}
               <button className="secondary" disabled={finishedBatchBusy || finishedVideos.length === 0} onClick={reanalyzeFinishedBatch}>
                 {finishedBatchBusy ? "分析中..." : "重新批量分析"}
               </button>
@@ -1013,13 +1255,32 @@ function ImportAnalyze(props: {
             multiple
             onChange={handleFinishedFilesSelected}
           />
+          {recentRemoveBgmTasks.length > 0 && (
+            <section className="task-status-strip import-task-strip">
+              {recentRemoveBgmTasks.map((task) => (
+                <span key={task.id}>{taskStatusLabel(task.status)} · {String(task.metadata?.target_name || `任务 #${task.id}`)}</span>
+              ))}
+            </section>
+          )}
           <section className="inline-result-section">
-            <div className="video-grid compact-video-grid">
+            {(importing || finishedBatchBusy) && (
+              <div className="progress-strip loose-analysis-progress"><span /></div>
+            )}
+            <div className={`video-grid compact-video-grid ${finishedViewMode === "list" ? "analysis-list-view" : "analysis-grid-view"}`}>
               {finishedVideos.map((video) => {
                 const videoSegments = props.segments.filter((segment) => segment.video_id === video.id);
                 const timestamped = hasTranscriptSegments(video);
+                const isRunning = ["transcribing", "segmenting", "imported", "transcribed"].includes(video.status);
                 return (
                   <article className="video-card" key={video.id}>
+                    <label className="card-select-check">
+                      <input
+                        type="checkbox"
+                        checked={selectedFinishedVideoIds.includes(video.id)}
+                        onChange={() => toggleFinishedVideoSelection(video.id)}
+                      />
+                      选择
+                    </label>
                     <div className="video-preview-stack">
                       <video
                         src={`${API_BASE_URL}/videos/${video.id}/preview`}
@@ -1039,11 +1300,18 @@ function ImportAnalyze(props: {
                           {reanalyzingId === video.id ? "分析中..." : "重新分析"}
                         </button>
                       </div>
+                      <span className={`analysis-state-pill ${video.error_message || video.status === "failed" ? "failed" : video.status === "segmented" ? "done" : isRunning ? "running" : "pending"}`}>
+                        {video.error_message || video.status === "failed" ? "处理失败" : video.status === "segmented" ? "已完成" : isRunning ? "处理中" : statusLabel(video.status)}
+                      </span>
                       {video.status === "segmented" && !timestamped && (
                         <p className="field-hint warning-hint">当前视频没有 ASR 时间戳，片段边界为估算结果；重新分析后会更准。</p>
                       )}
-                      {video.error_message && <p className="error">{video.error_message}</p>}
-                      {["transcribing", "segmenting", "imported", "transcribed"].includes(video.status) && <div className="progress-strip"><span /></div>}
+                      {video.error_message && (
+                        <button className="inline-error-trigger" onClick={() => props.setError(formatProcessingError(video.error_message))}>
+                          查看失败原因
+                        </button>
+                      )}
+                      {isRunning && <div className="progress-strip"><span /></div>}
                       <VideoScriptList segments={videoSegments} />
                     </div>
                   </article>
@@ -1058,16 +1326,38 @@ function ImportAnalyze(props: {
           <div className="section-title compact-title">
             <div>
               <h2>导入零散素材并自动分析</h2>
-              <p>先输入产品卖点 tag，再导入产品展示、权益镜头或真人口播，AI 会按这些 tag 辅助识别。</p>
+              <p>先输入你希望 AI 识别的 tag；导入后系统会抽静帧，并只从这些 tag 中选择匹配项。</p>
+              <div className="mini-summary-strip">
+                <span>素材 {productSegments.length}</span>
+                <span>已打标 {productAnalyzedCount}</span>
+                <span>待打标 {productPendingCount}</span>
+                {selectedLooseVideoIds.length > 0 && <span>已选 {selectedLooseVideoIds.length}</span>}
+              </div>
             </div>
             <div className="import-primary-actions">
               <div className="inline-tag-vocab">
                 <TagInputChips
                   value={customTagDraft}
-                  onChange={setCustomTagDraft}
-                  placeholder="卖点/画面 tag"
+                  onChange={(value) => setCustomTagDraft(value)}
+                  onCommit={(value) => {
+                    setCustomTagDraft(value);
+                    void saveCustomTagsValue(value);
+                  }}
+                  placeholder="输入识别 tag"
                 />
-                <button className="secondary" onClick={() => saveCustomTags()}>保存</button>
+                <span className={customTagsDirty ? "tag-vocab-status dirty" : customTagCount > 0 ? "tag-vocab-status saved" : "tag-vocab-status empty"}>
+                  {customTagsDirty ? "自动保存中" : customTagCount > 0 ? `已应用 ${customTagCount} 个` : "未录入"}
+                </span>
+              </div>
+              <button className="secondary" disabled={productSegments.length === 0} onClick={toggleAllLooseVideos}>
+                {selectedLooseVideoIds.length === Array.from(new Set(productSegments.map((segment) => segment.video_id))).length && productSegments.length > 0 ? "取消全选" : "全选"}
+              </button>
+              <button className="danger-action" disabled={deleteBusy === "loose" || selectedLooseVideoIds.length === 0} onClick={() => deleteSelectedVideos("loose")}>
+                {deleteBusy === "loose" ? "删除中..." : "删除素材"}
+              </button>
+              <div className="view-toggle tiny-toggle">
+                <button className={looseViewMode === "grid" ? "active" : ""} onClick={() => setLooseViewMode("grid")}>网格</button>
+                <button className={looseViewMode === "list" ? "active" : ""} onClick={() => setLooseViewMode("list")}>列表</button>
               </div>
               <button className="secondary" disabled={batchTaggingBusy || productSegments.length === 0} onClick={analyzeProductBatch}>
                 {batchTaggingBusy ? "分析中..." : "重新批量分析"}
@@ -1086,38 +1376,62 @@ function ImportAnalyze(props: {
             onChange={handleLooseFilesSelected}
           />
           <div className="product-tagging-card inline-result-section">
-            <div className="video-grid compact-video-grid">
-              {productSegments.slice(0, 8).map((segment) => (
-                <article className="video-card product-preview-card" key={segment.id}>
-                  <div className="video-preview-stack">
-                    <video
-                      src={`${API_BASE_URL}/segments/${segment.id}/preview`}
-                      poster={`${API_BASE_URL}/segments/${segment.id}/thumbnail`}
-                      controls
-                      preload="metadata"
-                    />
-                  </div>
-                  <div>
-                    <div className="video-card-header">
-                      <div>
-                        <h2>{segment.video_name}</h2>
-                        <p>{formatClockPrecise(segment.start_seconds)} - {formatClockPrecise(segment.end_seconds)}</p>
-                      </div>
-                      <button className="secondary" disabled={taggingSegmentId === segment.id} onClick={() => analyzeVisual(segment.id)}>
-                        {taggingSegmentId === segment.id ? "打标中..." : "AI 打标"}
-                      </button>
+            {(assetImporting || batchTaggingBusy) && (
+              <div className="progress-strip loose-analysis-progress"><span /></div>
+            )}
+            <div className={`video-grid compact-video-grid ${looseViewMode === "list" ? "analysis-list-view" : "analysis-grid-view"}`}>
+              {productSegments.map((segment) => {
+                const hasAnalysis = Boolean(segment.visual_description || segment.selling_points || segment.visual_tags);
+                const isTagging = taggingSegmentId === segment.id;
+                return (
+                  <article className="video-card product-preview-card" key={segment.id}>
+                    <label className="card-select-check">
+                      <input
+                        type="checkbox"
+                        checked={selectedLooseVideoIds.includes(segment.video_id)}
+                        onChange={() => toggleLooseVideoSelection(segment.video_id)}
+                      />
+                      选择
+                    </label>
+                    <div className="video-preview-stack">
+                      <video
+                        src={`${API_BASE_URL}/segments/${segment.id}/preview`}
+                        poster={`${API_BASE_URL}/segments/${segment.id}/thumbnail`}
+                        controls
+                        preload="metadata"
+                      />
                     </div>
-                    <p>{segment.visual_description || "待分析"}</p>
-                    <div className="tag-line"><CompactTagChips values={[...splitMultiValue(segment.selling_points), ...splitMultiValue(segment.visual_tags)]} limit={3} /></div>
-                  </div>
-                </article>
-              ))}
+                    <div>
+                      <div className="video-card-header">
+                        <div>
+                          <h2>{segment.video_name}</h2>
+                          <p>{formatClockPrecise(segment.start_seconds)} - {formatClockPrecise(segment.end_seconds)}</p>
+                        </div>
+                        <button className="secondary" disabled={isTagging} onClick={() => analyzeVisual(segment.id)}>
+                          {isTagging ? "打标中..." : "AI 打标"}
+                        </button>
+                      </div>
+                      <span className={`analysis-state-pill ${visualErrors[segment.id] ? "failed" : hasAnalysis ? "done" : isTagging ? "running" : "pending"}`}>
+                        {visualErrors[segment.id] ? "打标失败" : hasAnalysis ? "已打标" : isTagging ? "打标中" : "待打标"}
+                      </span>
+                      {isTagging && <div className="progress-strip"><span /></div>}
+                      {visualErrors[segment.id] && (
+                        <button className="inline-error-trigger" onClick={() => props.setError(visualErrors[segment.id])}>
+                          查看原因
+                        </button>
+                      )}
+                      <p>{segment.visual_description || "待分析"}</p>
+                      <div className="tag-line"><CompactTagChips values={[...splitMultiValue(segment.selling_points), ...splitMultiValue(segment.visual_tags)]} limit={3} /></div>
+                    </div>
+                  </article>
+                );
+              })}
               {productSegments.length === 0 && <p className="empty">导入产品展示/权益镜头后会出现在这里。</p>}
             </div>
           </div>
         </div>
       </section>
-      {showBgmDialog && (
+      {REMOVE_BGM_ENABLED && showBgmDialog && (
         <div className="modal-backdrop" onClick={() => setShowBgmDialog(false)}>
           <section className="bgm-select-dialog" onClick={(event) => event.stopPropagation()}>
             <div className="split-head">
@@ -1129,20 +1443,37 @@ function ImportAnalyze(props: {
             </div>
             <label className="checkbox-line compact-check bgm-select-all">
               <input
-                checked={finishedVideos.length > 0 && selectedBgmVideoIds.length === finishedVideos.length}
-                onChange={(event) => setSelectedBgmVideoIds(event.target.checked ? finishedVideos.map((video) => video.id) : [])}
+                checked={selectableBgmVideoIds.length > 0 && selectedBgmVideoIds.length === selectableBgmVideoIds.length}
+                disabled={selectableBgmVideoIds.length === 0}
+                onChange={(event) => setSelectedBgmVideoIds(event.target.checked ? selectableBgmVideoIds : [])}
                 type="checkbox"
               />
               全选
             </label>
             <div className="bgm-select-list">
-              {finishedVideos.map((video) => (
-                <label className="checkbox-line compact-check" key={video.id}>
-                  <input checked={selectedBgmVideoIds.includes(video.id)} onChange={() => toggleBgmVideo(video.id)} type="checkbox" />
-                  <span>{video.name}</span>
-                </label>
-              ))}
+              {finishedVideos.map((video) => {
+                const hasActiveTask = activeRemoveBgmVideoIds.has(video.id);
+                return (
+                  <label className={hasActiveTask ? "checkbox-line compact-check disabled-check" : "checkbox-line compact-check"} key={video.id}>
+                    <input checked={selectedBgmVideoIds.includes(video.id)} disabled={hasActiveTask} onChange={() => toggleBgmVideo(video.id)} type="checkbox" />
+                    <span>{video.name}</span>
+                    {hasActiveTask && <strong>已创建任务</strong>}
+                  </label>
+                );
+              })}
             </div>
+            {recentRemoveBgmTasks.length > 0 && (
+              <div className="task-list compact-task-list">
+                {recentRemoveBgmTasks.map((task) => (
+                  <div className="compact-row task-row" key={task.id}>
+                    <div>
+                      <span>{String(task.metadata?.target_name || `任务 #${task.id}`)}</span>
+                      <small>{taskStatusLabel(task.status)} · {task.message || "等待处理"}</small>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="modal-actions">
               <button className="secondary" onClick={() => setShowBgmDialog(false)}>取消</button>
               <button className="primary-action" disabled={selectedBgmVideoIds.length === 0} onClick={removeBgmForSelectedVideos}>创建任务 {selectedBgmVideoIds.length}</button>
@@ -1175,12 +1506,27 @@ function statusLabel(status: string) {
   return labels[status] ?? status;
 }
 
+function taskStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    queued: "已排队",
+    waiting_worker: "等待 Worker",
+    running: "处理中",
+    completed: "已完成",
+    failed: "失败",
+  };
+  return labels[status] ?? status;
+}
+
 function VideoSegmentSummary(props: { segments: Segment[]; transcript: string }) {
   const tagCounts = props.segments.reduce<Record<string, number>>((counts, segment) => {
-    counts[segment.semantic_type] = (counts[segment.semantic_type] ?? 0) + 1;
+    splitMultiValue(segment.semantic_type).forEach((tag) => {
+      counts[tag] = (counts[tag] ?? 0) + 1;
+    });
     return counts;
   }, {});
   const orderedTags = Object.entries(tagCounts).sort((a, b) => b[1] - a[1]);
+  const visibleTags = orderedTags.slice(0, 1);
+  const hiddenTags = orderedTags.slice(1);
   const wordCount = props.transcript.length;
 
   return (
@@ -1191,17 +1537,13 @@ function VideoSegmentSummary(props: { segments: Segment[]; transcript: string })
       </div>
       {orderedTags.length > 0 ? (
         <div className="tag-counts">
-          {orderedTags.slice(0, 3).map(([tag, count]) => (
+          {visibleTags.map(([tag, count]) => (
             <span className={`tag-chip tag-count-chip ${tagColorClass(tag)}`} key={tag}>{tag} {count}</span>
           ))}
-          {orderedTags.length > 3 && (
-            <span
-              className="tag-chip tag-color-default tag-overflow-chip"
-              data-overflow={orderedTags.slice(3).map(([tag, count]) => `${tag} ${count}`).join(" / ")}
-              title={orderedTags.slice(3).map(([tag, count]) => `${tag} ${count}`).join(" / ")}
-            >
-              ...
-            </span>
+          {hiddenTags.length > 0 && (
+            <TagOverflowChip
+              items={hiddenTags.map(([tag, count]) => ({ tag, label: `${tag} ${count}` }))}
+            />
           )}
         </div>
       ) : (
@@ -1891,19 +2233,23 @@ function TagChip(props: { tag: string; className?: string }) {
   return <span className={`tag-chip ${tagColorClass(props.tag)} ${props.className ?? ""}`.trim()}>{props.tag}</span>;
 }
 
-function TagInputChips(props: { value: string; onChange: (value: string) => void; placeholder?: string }) {
+function TagInputChips(props: { value: string; onChange: (value: string) => void; onCommit?: (value: string) => void; placeholder?: string }) {
   const [draft, setDraft] = useState("");
   const tags = splitMultiValue(props.value);
 
   function commit(input = draft) {
     const nextTags = splitMultiValue(input);
     if (nextTags.length === 0) return;
-    props.onChange(joinMultiValue(Array.from(new Set([...tags, ...nextTags]))));
+    const nextValue = joinMultiValue(Array.from(new Set([...tags, ...nextTags])));
+    props.onChange(nextValue);
+    props.onCommit?.(nextValue);
     setDraft("");
   }
 
   function removeTag(tag: string) {
-    props.onChange(joinMultiValue(tags.filter((item) => item !== tag)));
+    const nextValue = joinMultiValue(tags.filter((item) => item !== tag));
+    props.onChange(nextValue);
+    props.onCommit?.(nextValue);
   }
 
   return (
@@ -2872,11 +3218,13 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
     });
     return groups;
   }, new Map()).values()).sort((left, right) => right.segments.length - left.segments.length || left.tag.localeCompare(right.tag)).slice(0, 18);
-  const groupedSegments = filtered.reduce<Record<string, Segment[]>>((groups, segment) => {
-    groups[segment.video_name] = groups[segment.video_name] ?? [];
-    groups[segment.video_name].push(segment);
-    return groups;
-  }, {});
+  const groupedSegments = libraryGroup === "loose"
+    ? (filtered.length > 0 ? { "全部零散素材": filtered } : {})
+    : filtered.reduce<Record<string, Segment[]>>((groups, segment) => {
+      groups[segment.video_name] = groups[segment.video_name] ?? [];
+      groups[segment.video_name].push(segment);
+      return groups;
+    }, {});
   const selectedVideo = selected ? props.videos.find((video) => video.id === selected.video_id) : null;
   const previewOrientation = selectedVideo && selectedVideo.height > selectedVideo.width ? "portrait" : "landscape";
 
@@ -3201,7 +3549,7 @@ function SegmentLibrary(props: { segments: Segment[]; videos: VideoItem[]; onRef
         </section>
       </div>
 
-      <section className="segment-workbench">
+      <section className={`segment-workbench ${previewOrientation}`}>
         <div className="segment-browser">
           <p className="segment-count">{filtered.length} / {groupSegments.length} 个分镜</p>
           {Object.entries(groupedSegments).map(([videoName, videoSegments]) => (
@@ -3372,11 +3720,25 @@ function CompactTagChips(props: { values: string[]; limit?: number }) {
     <>
       {visible.map((tag) => <TagChip key={tag} tag={tag} />)}
       {hidden.length > 0 && (
-        <span className="tag-chip tag-color-default tag-overflow-chip" data-overflow={hidden.join(" / ")} title={hidden.join(" / ")}>
-          ...
-        </span>
+        <TagOverflowChip items={hidden.map((tag) => ({ tag }))} />
       )}
     </>
+  );
+}
+
+function TagOverflowChip(props: { items: Array<{ tag: string; label?: string }> }) {
+  const label = props.items.map((item) => item.label ?? item.tag).join(" / ");
+  return (
+    <span className="tag-chip tag-color-default tag-overflow-chip" tabIndex={0} aria-label={label}>
+      ...
+      <span className="tag-overflow-tooltip" aria-hidden="true">
+        {props.items.map((item) => (
+          <span className={`tag-chip ${tagColorClass(item.tag)}`} key={`${item.tag}:${item.label ?? ""}`}>
+            {item.label ?? item.tag}
+          </span>
+        ))}
+      </span>
+    </span>
   );
 }
 
@@ -4328,6 +4690,38 @@ function SettingsView(props: { settings: Settings; onSaved: () => void; setMessa
     setDraft((current) => ({ ...current, [key]: value }));
   }
 
+  function preventSecretCopy(event: ClipboardEvent<HTMLInputElement>) {
+    event.preventDefault();
+  }
+
+  function applyVisionPreset(value: string) {
+    const presets: Record<string, { baseUrl: string; model: string; authType: string }> = {
+      qwen_vl: {
+        baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model: "qwen-vl-plus",
+        authType: "bearer",
+      },
+      xiaomi_mimo: {
+        baseUrl: "https://api.xiaomimimo.com/v1",
+        model: "mimo-v2.5",
+        authType: "api-key",
+      },
+    };
+    const preset = presets[value];
+    if (!preset) {
+      setValue("vision_provider", value);
+      return;
+    }
+    setDraft((current) => ({
+      ...current,
+      vision_provider: value,
+      vision_base_url: preset.baseUrl,
+      vision_model: preset.model,
+      vision_auth_type: preset.authType,
+      vision_json_mode: "true",
+    }));
+  }
+
   async function save() {
     try {
       await api("/settings", {
@@ -4342,7 +4736,7 @@ function SettingsView(props: { settings: Settings; onSaved: () => void; setMessa
     }
   }
 
-  async function test(target: "ai" | "asr" | "tts") {
+  async function test(target: "ai" | "vision" | "asr" | "tts") {
     try {
       const result = await api<{ message: string }>("/settings/test", {
         method: "POST",
@@ -4374,7 +4768,7 @@ function SettingsView(props: { settings: Settings; onSaved: () => void; setMessa
           <label>Base URL</label>
           <input value={draft.ai_base_url ?? ""} onChange={(event) => setValue("ai_base_url", event.target.value)} />
           <label>API Key</label>
-          <input value={draft.ai_api_key ?? ""} onChange={(event) => setValue("ai_api_key", event.target.value)} placeholder="本地服务可留空" />
+          <input type="password" autoComplete="new-password" value={draft.ai_api_key ?? ""} onCopy={preventSecretCopy} onChange={(event) => setValue("ai_api_key", event.target.value)} placeholder="本地服务可留空" />
           <label>模型名</label>
           <input value={draft.ai_model ?? ""} onChange={(event) => setValue("ai_model", event.target.value)} />
           <label className="inline-check">
@@ -4385,6 +4779,35 @@ function SettingsView(props: { settings: Settings; onSaved: () => void; setMessa
           <p className="field-hint">填完 API Key 后要点“保存设置”，再点“测试 AI”。本地兼容服务可以留空，DeepSeek/通义云端不能留空。</p>
           <div className="action-row">
             <button className="secondary" onClick={() => test("ai")}>测试 AI</button>
+            <button className="primary-action" onClick={save}>保存设置</button>
+          </div>
+        </div>
+        <div className="panel settings-panel">
+          <h2>视觉 AI API</h2>
+          <p className="field-hint">仅用于“导入分析 / 零散素材导入”的静帧识别打标，不影响成片 ASR、文案和混剪方案。</p>
+          <label>预设</label>
+          <select
+            value={draft.vision_provider ?? "qwen_vl"}
+            onChange={(event) => applyVisionPreset(event.target.value)}
+          >
+            <option value="qwen_vl">通义千问 VL</option>
+            <option value="xiaomi_mimo">小米 MiMo-V2.5</option>
+            <option value="custom">自定义 OpenAI 兼容视觉模型</option>
+          </select>
+          <label>Base URL</label>
+          <input value={draft.vision_base_url ?? ""} onChange={(event) => setValue("vision_base_url", event.target.value)} placeholder={draft.vision_provider === "xiaomi_mimo" ? "https://api.xiaomimimo.com/v1" : "https://dashscope.aliyuncs.com/compatible-mode/v1"} />
+          <label>API Key</label>
+          <input type="password" autoComplete="new-password" value={draft.vision_api_key ?? ""} onCopy={preventSecretCopy} onChange={(event) => setValue("vision_api_key", event.target.value)} placeholder={draft.vision_provider === "xiaomi_mimo" ? "小米 MiMo API Key" : "DashScope API Key"} />
+          <label>视觉模型名</label>
+          <input value={draft.vision_model ?? ""} onChange={(event) => setValue("vision_model", event.target.value)} placeholder={draft.vision_provider === "xiaomi_mimo" ? "mimo-v2.5" : "qwen-vl-plus"} />
+          <input type="hidden" value={draft.vision_auth_type ?? "bearer"} />
+          <label className="inline-check">
+            <input type="checkbox" checked={(draft.vision_json_mode ?? "true") === "true"} onChange={(event) => setValue("vision_json_mode", String(event.target.checked))} />
+            启用 JSON 模式
+          </label>
+          <p className="field-hint">选择预设后会自动填写地址、模型和鉴权方式，用户只需要填 Key。千问可用 qwen-vl-plus/qwen-vl-max；小米默认 mimo-v2.5。</p>
+          <div className="action-row">
+            <button className="secondary" onClick={() => test("vision")}>测试视觉 AI</button>
             <button className="primary-action" onClick={save}>保存设置</button>
           </div>
         </div>
@@ -4405,9 +4828,9 @@ function SettingsView(props: { settings: Settings; onSaved: () => void; setMessa
           <input value={draft.local_whisper_language ?? "zh"} onChange={(event) => setValue("local_whisper_language", event.target.value)} placeholder="中文填 zh，自动识别可填 auto" />
           <p className="field-hint">本地运行 whisper.cpp，不上传音频；如果测试提示缺少命令，可安装 brew install whisper-cpp。</p>
           <label>阿里云 AccessKey ID</label>
-          <input value={draft.aliyun_access_key_id ?? ""} onChange={(event) => setValue("aliyun_access_key_id", event.target.value)} />
+          <input type="password" autoComplete="new-password" value={draft.aliyun_access_key_id ?? ""} onCopy={preventSecretCopy} onChange={(event) => setValue("aliyun_access_key_id", event.target.value)} />
           <label>阿里云 AccessKey Secret</label>
-          <input value={draft.aliyun_access_key_secret ?? ""} onChange={(event) => setValue("aliyun_access_key_secret", event.target.value)} />
+          <input type="password" autoComplete="new-password" value={draft.aliyun_access_key_secret ?? ""} onCopy={preventSecretCopy} onChange={(event) => setValue("aliyun_access_key_secret", event.target.value)} />
           <label>NLS AppKey</label>
           <input value={draft.aliyun_app_key ?? ""} onChange={(event) => setValue("aliyun_app_key", event.target.value)} />
           <label>兼容 ASR Base URL</label>
@@ -4424,7 +4847,7 @@ function SettingsView(props: { settings: Settings; onSaved: () => void; setMessa
           <label>兼容 TTS Base URL</label>
           <input value={draft.tts_base_url ?? ""} onChange={(event) => setValue("tts_base_url", event.target.value)} placeholder="例如 OpenAI/Qwen 兼容语音服务地址" />
           <label>TTS API Key</label>
-          <input value={draft.tts_api_key ?? ""} onChange={(event) => setValue("tts_api_key", event.target.value)} placeholder="本地服务可留空" />
+          <input type="password" autoComplete="new-password" value={draft.tts_api_key ?? ""} onCopy={preventSecretCopy} onChange={(event) => setValue("tts_api_key", event.target.value)} placeholder="本地服务可留空" />
           <label>TTS 模型名</label>
           <input value={draft.tts_model ?? ""} onChange={(event) => setValue("tts_model", event.target.value)} placeholder="例如 qwen-tts 或兼容模型名" />
           <label>默认音色</label>

@@ -63,6 +63,7 @@ It runs:
 
 Code-level validation is not a substitute for media validation. Before calling V1 release-ready, test with real files:
 
+- Use `docs/V1_验收清单.md` as the checklist and `docs/V1_发布验收记录.md` as the release run log.
 - 3 finished voiceover videos: import, ASR, slice, tag, tag export, AI timeline, fine-tune, export
 - 5 product/benefit shots: visual analysis, selling-point tags, user tag correction
 - 1 manual script and 1 Douyin-derived script rewrite

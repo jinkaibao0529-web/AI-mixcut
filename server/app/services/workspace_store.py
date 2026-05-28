@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -236,6 +237,12 @@ def _seed_settings(connection: sqlite3.Connection) -> None:
         "ai_api_key": "",
         "ai_model": "deepseek-chat",
         "ai_json_mode": "true",
+        "vision_provider": "qwen_vl",
+        "vision_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "vision_api_key": "",
+        "vision_model": "qwen-vl-plus",
+        "vision_auth_type": "bearer",
+        "vision_json_mode": "true",
         "asr_provider": "local_whisper",
         "asr_base_url": "",
         "asr_api_key": "",
@@ -287,7 +294,7 @@ def get_settings(*, masked: bool = False) -> dict[str, str]:
         rows = connection.execute("SELECT key, value FROM settings").fetchall()
     values = {str(row["key"]): str(row["value"]) for row in rows}
     if masked:
-        for key in ("ai_api_key", "asr_api_key", "aliyun_access_key_secret", "tts_api_key"):
+        for key in ("ai_api_key", "vision_api_key", "asr_api_key", "aliyun_access_key_secret", "tts_api_key"):
             values[key] = _mask_secret(values.get(key, ""))
         values["aliyun_access_key_id"] = _mask_secret(values.get("aliyun_access_key_id", ""))
     return values
@@ -300,7 +307,7 @@ def update_settings(values: dict[str, str]) -> dict[str, str]:
         for key, value in values.items():
             if key not in allowed:
                 continue
-            if value == "********":
+            if _is_masked_secret(str(value)):
                 continue
             connection.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -315,6 +322,10 @@ def _mask_secret(value: str) -> str:
     if len(value) <= 8:
         return "********"
     return f"{value[:4]}****{value[-4:]}"
+
+
+def _is_masked_secret(value: str) -> bool:
+    return value == "********" or bool(re.fullmatch(r".{1,8}\*{4,}.{1,8}", value))
 
 
 def create_project(name: str, custom_prompt: str = "", category: str = "默认") -> dict[str, Any]:
@@ -490,6 +501,31 @@ def update_video(video_id: int, **values: Any) -> dict[str, Any]:
     if video:
         touch_project(int(video["project_id"]))
     return video or {}
+
+
+def delete_videos(video_ids: list[int]) -> int:
+    clean_ids = sorted({int(video_id) for video_id in video_ids if int(video_id) > 0})
+    if not clean_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in clean_ids)
+    with get_connection() as connection:
+        project_rows = connection.execute(
+            f"SELECT DISTINCT project_id FROM videos WHERE id IN ({placeholders})",
+            tuple(clean_ids),
+        ).fetchall()
+        segment_rows = connection.execute(
+            f"SELECT id FROM segments WHERE video_id IN ({placeholders})",
+            tuple(clean_ids),
+        ).fetchall()
+    segment_ids = [int(row["id"]) for row in segment_rows]
+    if segment_ids:
+        delete_segments(segment_ids)
+    with get_connection() as connection:
+        cursor = connection.execute(f"DELETE FROM videos WHERE id IN ({placeholders})", tuple(clean_ids))
+        affected = int(cursor.rowcount or 0)
+    for row in project_rows:
+        touch_project(int(row["project_id"]))
+    return affected
 
 
 def replace_video_segments(video_id: int, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:

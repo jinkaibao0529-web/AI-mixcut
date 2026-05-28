@@ -3,6 +3,7 @@ import hashlib
 import shutil
 import subprocess
 import uuid
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import UploadFile
@@ -21,11 +22,59 @@ TRIM_VIDEO_END_GUARD_SECONDS = 0.02
 SCHEME_END_GUARD_SECONDS = 0.02
 
 
+def clean_ffmpeg_error(message: str) -> str:
+    """Keep the actionable FFmpeg failure and drop version/configuration noise."""
+    lines = [line.strip() for line in (message or "").splitlines() if line.strip()]
+    if not lines:
+        return "FFmpeg 处理失败。"
+
+    noise_prefixes = (
+        "ffmpeg version",
+        "ffprobe version",
+        "built with",
+        "configuration:",
+        "libavutil",
+        "libavcodec",
+        "libavformat",
+        "libavdevice",
+        "libavfilter",
+        "libswscale",
+        "libswresample",
+        "libpostproc",
+    )
+    meaningful = [line for line in lines if not line.lower().startswith(noise_prefixes)]
+    if not meaningful:
+        return "FFmpeg 处理失败，请检查视频文件是否完整或格式是否受支持。"
+
+    important_markers = ("error", "invalid", "failed", "not found", "no such", "could not", "unsupported", "moov atom")
+    important = [line for line in meaningful if any(marker in line.lower() for marker in important_markers)]
+    selected = important[-3:] if important else meaningful[-3:]
+    cleaned = "；".join(selected)
+    return cleaned[:500]
+
+
+def _quiet_command(command: list[str]) -> list[str]:
+    if not command:
+        return command
+    executable = Path(command[0]).name
+    if executable in {"ffmpeg", "ffprobe"} and "-hide_banner" not in command:
+        return [command[0], "-hide_banner", *command[1:]]
+    return command
+
+
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    result = subprocess.run(_quiet_command(command), capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        raise VideoProcessingError(result.stderr.strip() or "FFmpeg command failed.")
+        raise VideoProcessingError(clean_ffmpeg_error(result.stderr.strip() or result.stdout.strip() or "FFmpeg command failed."))
     return result
+
+
+@lru_cache(maxsize=16)
+def _ffmpeg_filter_available(filter_name: str) -> bool:
+    result = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return False
+    return any(line.split()[1:2] == [filter_name] for line in result.stdout.splitlines())
 
 
 def probe_duration(video_path: Path) -> float:
@@ -182,10 +231,10 @@ def segment_av_signature(segment: dict[str, object]) -> str:
 
 
 def _decoded_stream_hash(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, check=False)
+    result = subprocess.run(_quiet_command(command), capture_output=True, check=False)
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="ignore").strip()
-        raise VideoProcessingError(stderr or "FFmpeg fingerprint failed.")
+        raise VideoProcessingError(clean_ffmpeg_error(stderr or "FFmpeg fingerprint failed."))
     return hashlib.sha256(result.stdout).hexdigest()
 
 
@@ -239,6 +288,28 @@ def create_thumbnail(video_path: Path, target_path: Path, *, seconds: float = 0.
         ]
     )
     return target_path
+
+
+def extract_representative_frames(video_path: Path, target_dir: Path, *, start_seconds: float = 0.0, end_seconds: float | None = None, count: int = 3) -> list[Path]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        duration = probe_duration(video_path)
+    except VideoProcessingError:
+        duration = 0.0
+    start = max(0.0, start_seconds)
+    end = min(duration, end_seconds if end_seconds is not None else duration) if duration > 0 else max(start + 0.1, end_seconds or start + 1.0)
+    if end <= start:
+        end = start + max(0.1, duration or 1.0)
+    ratios = [0.2, 0.5, 0.8][: max(1, count)]
+    if count == 1:
+        ratios = [0.5]
+    frames: list[Path] = []
+    for index, ratio in enumerate(ratios, start=1):
+        timestamp = start + (end - start) * ratio
+        frame_path = target_dir / f"frame_{index:02d}.jpg"
+        create_thumbnail(video_path, frame_path, seconds=timestamp)
+        frames.append(frame_path)
+    return frames
 
 
 def extract_audio_for_whisper(video_path: Path, target_path: Path) -> Path:
@@ -609,7 +680,7 @@ def _finalize_timeline_export(source_path: Path, export_path: Path, timeline: di
     target_lufs = float(timeline.get("target_lufs") or -14)
     bgm_path = _asset_path_from_timeline(timeline, "bgm_asset")
     voice_path = _asset_path_from_timeline(timeline, "voice_asset")
-    burn_subtitles = bool(int(timeline.get("burn_subtitles") or 0))
+    burn_subtitles = bool(int(timeline.get("burn_subtitles") or 0)) and _ffmpeg_filter_available("subtitles")
     subtitle_path = _write_timeline_subtitles(timeline, work_dir) if burn_subtitles else None
 
     needs_processing = (
@@ -645,7 +716,7 @@ def _finalize_timeline_export(source_path: Path, export_path: Path, timeline: di
     filters: list[str] = []
     video_label = "0:v"
     if subtitle_path:
-        filters.append(f"[0:v]subtitles='{_escape_filter_path(subtitle_path)}'[vout]")
+        filters.append(f"[0:v]subtitles=filename='{_escape_filter_path(subtitle_path)}'[vout]")
         video_label = "vout"
 
     audio_sources: list[str] = []

@@ -60,7 +60,7 @@ Added or expanded endpoints:
 - `PATCH /scripts/{script_id}`
 - `POST /tts/generate`
 - `POST /timelines/generate-from-voice`
-- `POST /audio/remove-bgm`
+- `POST /audio/remove-bgm` (currently disabled, returns 501)
 - `POST /material-mix/timelines/{timeline_id}/export`
 
 ## Data Model
@@ -126,9 +126,7 @@ V1 placeholder behavior:
 
 The desktop app and main backend stay lightweight. Heavy model work is represented as optional `ai_tasks`.
 
-Current worker-ready task:
-
-- `remove_bgm`
+No worker task is enabled in V1. `remove_bgm` is kept as a future integration point and does not create waiting tasks.
 
 Planned worker capabilities:
 

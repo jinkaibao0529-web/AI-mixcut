@@ -4,14 +4,17 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
+import base64
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from app.core.paths import TMP_DIR
 from app.services.workspace_store import get_settings
-from app.services.video_processor import VideoProcessingError, extract_audio_for_whisper, extract_pcm_16k, extract_wav_16k
+from app.services.video_processor import VideoProcessingError, extract_audio_for_whisper, extract_pcm_16k, extract_representative_frames, extract_wav_16k
 
 
 SEGMENT_TYPES = [
@@ -43,6 +46,16 @@ async def test_ai_settings() -> dict[str, str]:
     _require_ai_settings(settings)
     await _chat_completion(settings, "只回复 JSON：{\"ok\":true}", json_mode=True)
     return {"status": "ok", "message": "AI API 可用"}
+
+
+async def test_vision_settings() -> dict[str, str]:
+    settings = _vision_settings(get_settings(masked=False))
+    _require_ai_settings(settings)
+    test_dir = TMP_DIR / "vision_settings_test"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    image_path = _create_vision_test_image(test_dir)
+    await _vision_chat_completion(settings, "只回复 JSON：{\"ok\":true}", [image_path], json_mode=True)
+    return {"status": "ok", "message": f"视觉 AI API 可用：{settings.get('ai_model')}"}
 
 
 async def test_asr_settings() -> dict[str, str]:
@@ -121,7 +134,7 @@ async def segment_transcript(video: dict[str, Any]) -> list[dict[str, Any]]:
         f"\n视频时长：{duration:.1f} 秒\n转录文本：{transcript}"
     )
     content = await _chat_completion(settings, prompt, json_mode=settings.get("ai_json_mode") == "true")
-    parsed = _loads_json(content)
+    parsed = _loads_provider_json(content, context="AI 语义切分结果")
     if not isinstance(parsed, list):
         raise ProviderError("AI 语义切分结果格式不正确。")
     return _normalize_segments(parsed, duration)
@@ -156,7 +169,7 @@ async def _segment_timestamped_transcript(video: dict[str, Any], timestamp_segme
         f"\n视频名称：{video.get('name')}\nASR 句子：{json.dumps(sentences, ensure_ascii=False)}"
     )
     content = await _chat_completion(settings, prompt, json_mode=settings.get("ai_json_mode") == "true")
-    parsed = _loads_json(content)
+    parsed = _loads_provider_json(content, context="AI 语义切分结果")
     if not isinstance(parsed, list):
         raise ProviderError("AI 语义切分结果格式不正确。")
     normalized = _normalize_timestamped_segments(parsed, sentences)
@@ -388,7 +401,7 @@ async def generate_schemes(
         f"\n可用片段：{json.dumps(compact_segments, ensure_ascii=False)}"
     )
     content = await _chat_completion(settings, prompt, json_mode=settings.get("ai_json_mode") == "true")
-    parsed = _loads_json(content)
+    parsed = _loads_provider_json(content, context="AI 混剪方案")
     if not isinstance(parsed, list):
         raise ProviderError("AI 混剪方案格式不正确。")
     return _normalize_schemes(parsed, compact_segments, scheme_count, segment_count, outputs_per_strategy)
@@ -433,6 +446,18 @@ def _require_ai_settings(settings: dict[str, str]) -> None:
         raise ProviderError("请先填写 AI API Key。DeepSeek、通义千问等云端接口不能留空。")
 
 
+def _vision_settings(settings: dict[str, str]) -> dict[str, str]:
+    return {
+        **settings,
+        "ai_base_url": settings.get("vision_base_url") or settings.get("ai_base_url", ""),
+        "ai_api_key": settings.get("vision_api_key") or settings.get("ai_api_key", ""),
+        "ai_model": settings.get("vision_model") or settings.get("ai_model", ""),
+        "ai_json_mode": settings.get("vision_json_mode") or settings.get("ai_json_mode", "true"),
+        "ai_auth_type": settings.get("vision_auth_type") or "bearer",
+        "ai_provider_label": settings.get("vision_provider") or "vision",
+    }
+
+
 def _resolve_whisper_binary(settings: dict[str, str]) -> str:
     configured = settings.get("local_whisper_binary_path", "").strip()
     candidates = [
@@ -475,7 +500,10 @@ async def _chat_completion(settings: dict[str, str], prompt: str, *, json_mode: 
     headers = {"Content-Type": "application/json"}
     api_key = settings.get("ai_api_key", "")
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        if settings.get("ai_auth_type") == "api-key":
+            headers["api-key"] = api_key
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
     payload: dict[str, Any] = {
         "model": settings["ai_model"],
         "messages": [
@@ -508,6 +536,72 @@ async def _chat_completion(settings: dict[str, str], prompt: str, *, json_mode: 
         return str(data["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError) as exc:
         raise ProviderError("AI API 返回格式不正确。") from exc
+
+
+async def _vision_chat_completion(settings: dict[str, str], prompt: str, image_paths: list[Path], *, json_mode: bool) -> str:
+    base_url = settings["ai_base_url"].rstrip("/")
+    url = f"{base_url}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    api_key = settings.get("ai_api_key", "")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    content: list[dict[str, Any]] = []
+    for image_path in image_paths:
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+    content.append({"type": "text", "text": prompt})
+    payload: dict[str, Any] = {
+        "model": settings["ai_model"],
+        "messages": [
+            {"role": "system", "content": "你是电商短视频视觉打标系统。请严格按用户给定 tag 词库判断，不要新增 tag。"},
+            {"role": "user", "content": content},
+        ],
+        "temperature": 0.2,
+        "max_completion_tokens": 4096 if settings.get("ai_provider_label") == "xiaomi_mimo" else 1024,
+    }
+    if json_mode and settings.get("ai_provider_label") != "xiaomi_mimo":
+        payload["response_format"] = {"type": "json_object"}
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            response = await client.post(url, json=payload, headers=headers)
+    except httpx.HTTPError as exc:
+        raise ProviderError(f"视觉 AI API 请求失败：{exc}") from exc
+    if response.status_code >= 400:
+        if response.status_code in {401, 403}:
+            provider_label = "小米 MiMo" if settings.get("ai_provider_label") == "xiaomi_mimo" else "DashScope/千问"
+            raise ProviderError(f"视觉 AI API 鉴权失败，请填写正确的 {provider_label} API Key。")
+        raise ProviderError(
+            f"视觉 AI API 请求失败：{response.status_code}。当前模型可能不支持图片输入，请在设置中切换到通义千问 VL、小米 MiMo-V2.5 或其他 OpenAI 兼容视觉模型。"
+        )
+    data = response.json()
+    try:
+        return str(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ProviderError("视觉 AI API 返回格式不正确。") from exc
+
+
+def _create_vision_test_image(target_dir: Path) -> Path:
+    image_path = target_dir / "vision_test.jpg"
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=white:s=32x32:d=0.1",
+            "-frames:v",
+            "1",
+            str(image_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ProviderError("生成视觉测试图片失败，请确认 FFmpeg 可用。")
+    return image_path
 
 
 async def _transcribe_whisper(settings: dict[str, str], video_path: Path) -> str:
@@ -801,8 +895,10 @@ def _loads_json(content: str) -> Any:
     fenced = re.search(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.DOTALL)
     if fenced:
         cleaned = fenced.group(1).strip()
-    if cleaned.startswith("{"):
-        parsed = json.loads(cleaned)
+    object_start = cleaned.find("{")
+    object_end = cleaned.rfind("}")
+    if object_start >= 0 and object_end > object_start:
+        parsed = json.loads(cleaned[object_start : object_end + 1])
         for key in ("segments", "schemes", "requirements", "data"):
             if key in parsed:
                 return parsed[key]
@@ -812,6 +908,14 @@ def _loads_json(content: str) -> Any:
     if start >= 0 and end > start:
         cleaned = cleaned[start : end + 1]
     return json.loads(cleaned)
+
+
+def _loads_provider_json(content: str, *, context: str) -> Any:
+    try:
+        return _loads_json(content)
+    except json.JSONDecodeError as exc:
+        preview = content.strip().replace("\n", " ")[:180]
+        raise ProviderError(f"{context}没有按 JSON 返回，请重试或切换模型。返回内容：{preview or '空'}") from exc
 
 
 def _normalize_segments(items: list[Any], duration: float) -> list[dict[str, Any]]:
@@ -858,39 +962,57 @@ def _normalize_segments(items: list[Any], duration: float) -> list[dict[str, Any
 
 
 async def analyze_product_visual(segment: dict[str, Any], custom_tags: str = "") -> dict[str, Any]:
-    settings = get_settings(masked=False)
+    settings = _vision_settings(get_settings(masked=False))
     _require_ai_settings(settings)
-    tag_instruction = (
-        f"用户自定义 tag 词库：{custom_tags}。selling_points 和 visual_tags 必须优先从这些 tag 中选择；"
-        "只有画面确实需要且词库没有覆盖时，才允许补充少量新 tag。"
-        "这些用户自定义 tag 只能用于 selling_points 或 visual_tags，绝对不要用于 semantic_type；"
-        f"semantic_type 仍然只能属于系统大类：{'、'.join(SEGMENT_TYPES)}。"
-        if custom_tags.strip()
-        else "selling_points 和 visual_tags 请生成简短、可复用、适合后续素材匹配的 tag。"
-    )
+    allowed_tags = _string_list(custom_tags)
+    if not allowed_tags:
+        raise ProviderError("请先在零散素材导入上方录入 tag 词库，AI 会按这些 tag 识别素材。")
+    video_path = Path(str(segment.get("video_path") or ""))
+    if not video_path.exists():
+        raise ProviderError("素材视频文件不存在，无法抽取静帧打标。")
+    frame_dir = TMP_DIR / "visual_tag_frames" / uuid.uuid4().hex
+    try:
+        frames = extract_representative_frames(
+            video_path,
+            frame_dir,
+            start_seconds=float(segment.get("start_seconds") or 0),
+            end_seconds=float(segment.get("end_seconds") or 0),
+            count=3,
+        )
+    except VideoProcessingError as exc:
+        raise ProviderError(f"抽取素材静帧失败：{exc}") from exc
     prompt = (
-        "你是电商短视频产品镜头分析师。请根据已有镜头信息推断这个镜头适合表达的卖点。"
-        "只输出 JSON 对象，不要 Markdown。字段：visual_description, selling_points, visual_tags, "
-        "suitable_positions, recommended_usage。selling_points、visual_tags、suitable_positions 都是数组。"
-        f"{tag_instruction}"
-        "如果画面信息不足，请根据文件名、片段台词和当前描述保守生成可编辑的初始标签。"
+        "你是电商短视频零散素材打标员。请只根据我提供的视频静帧判断这条素材可能属于哪些用户 tag。"
+        "重要规则："
+        "1. 只能从用户 tag 词库中选择 tag，绝对不要新增、改写、翻译或输出词库外 tag。"
+        "2. 用户 tag 只是这批产品自己的卖点/画面标签，不是系统大类语义 tag，不要输出 semantic_type。"
+        "3. 如果静帧无法判断某个 tag，就不要选；宁可少选，不要猜。"
+        "4. selling_points 和 visual_tags 都只能填用户 tag 词库里的原词。"
+        "只输出 JSON 对象，不要 Markdown。字段：visual_description, selling_points, visual_tags, recommended_usage。"
+        "selling_points、visual_tags 都是数组。"
+        f"\n用户 tag 词库：{json.dumps(allowed_tags, ensure_ascii=False)}"
         f"\n视频名：{segment.get('video_name')}"
         f"\n片段时间：{segment.get('start_seconds')} - {segment.get('end_seconds')}"
-        f"\n已有台词：{segment.get('text')}"
-        f"\n已有描述：{segment.get('visual_description')}"
-        f"\n已有语义 tag：{segment.get('semantic_type')}"
+        "\n请观察静帧中的产品、动作、材质、场景、权益信息，然后从用户 tag 词库里选择最匹配的 1-5 个。"
     )
-    content = await _chat_completion(settings, prompt, json_mode=settings.get("ai_json_mode") == "true")
-    parsed = _loads_json(content)
+    try:
+        content = await _vision_chat_completion(settings, prompt, frames, json_mode=settings.get("ai_json_mode") == "true")
+    finally:
+        shutil.rmtree(frame_dir, ignore_errors=True)
+    parsed = _loads_provider_json(content, context="AI 视觉分析结果")
     if isinstance(parsed, list):
         parsed = parsed[0] if parsed else {}
     if not isinstance(parsed, dict):
         raise ProviderError("AI 视觉分析结果格式不正确。")
+    description = str(parsed.get("visual_description") or segment.get("visual_description") or "").strip()
+    matched_tags = _string_list(parsed.get("matched_tags"))
+    selling_points = _filter_allowed_tags([*_string_list(parsed.get("selling_points")), *matched_tags, description], allowed_tags)
+    visual_tags = _filter_allowed_tags([*_string_list(parsed.get("visual_tags")), *matched_tags, description], allowed_tags)
     return {
-        "visual_description": str(parsed.get("visual_description") or segment.get("visual_description") or "").strip(),
-        "selling_points": _string_list(parsed.get("selling_points")),
-        "visual_tags": _string_list(parsed.get("visual_tags")),
-        "suitable_positions": _string_list(parsed.get("suitable_positions")) or ["中间"],
+        "visual_description": description,
+        "selling_points": selling_points,
+        "visual_tags": visual_tags,
+        "suitable_positions": ["中间"],
         "recommended_usage": str(parsed.get("recommended_usage") or "").strip(),
     }
 
@@ -910,7 +1032,7 @@ async def generate_script_lines(*, source_text: str, product_context: str, sourc
         f"\n输入文案或链接内容：{source_text}"
     )
     content = await _chat_completion(settings, prompt, json_mode=settings.get("ai_json_mode") == "true")
-    parsed = _loads_json(content)
+    parsed = _loads_provider_json(content, context="AI 文案结果")
     if isinstance(parsed, dict):
         parsed = parsed.get("lines", [])
     if not isinstance(parsed, list):
@@ -969,6 +1091,17 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     return [item.strip() for item in str(value or "").replace("，", ",").replace("/", ",").split(",") if item.strip()]
+
+
+def _filter_allowed_tags(values: list[str], allowed_tags: list[str]) -> list[str]:
+    selected: list[str] = []
+    for value in values:
+        for allowed in allowed_tags:
+            if value == allowed or value in allowed or allowed in value:
+                if allowed not in selected:
+                    selected.append(allowed)
+                break
+    return selected
 
 
 def _normalize_schemes(
